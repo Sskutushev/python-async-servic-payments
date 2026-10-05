@@ -13,7 +13,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.36,<2.1",
     "asyncpg>=0.30,<1",
     "alembic>=1.14,<2",
-    "faststream[rabbit]>=0.7,<0.8",
+    "faststream[rabbit]>=0.7.7,<0.8",
     "httpx>=0.27,<1",
     "uvicorn[standard]>=0.32,<1",
 ]
