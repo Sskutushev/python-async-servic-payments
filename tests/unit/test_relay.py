@@ -2,6 +2,8 @@ import asyncio
 import uuid
 from datetime import timedelta
 
+import pytest
+
 from payments.application.ports import PublishError
 from payments.application.relay import OutboxRelay
 from payments.domain.events import payment_created_event
@@ -102,6 +104,45 @@ async def test_lost_lease_after_publish_is_not_marked_by_the_loser(
     assert len(fast.published) == 1  # at-least-once: duplicate with the same event_id
     assert slow.published[0].id == fast.published[0].id
     assert not store.unpublished()
+
+
+async def test_event_whose_lease_expired_in_the_batch_is_not_published(
+    uow_factory, store, clock
+) -> None:
+    """Review P3: a slow batch must not publish events another relay may already own."""
+    seed_events(store, clock, 3)
+
+    class SlowPublisher(FakePublisher):
+        async def publish(self, event):  # type: ignore[no-untyped-def]
+            await super().publish(event)
+            clock.advance(LEASE)  # each publish takes longer than the whole lease
+
+    publisher = SlowPublisher()
+    r = relay(uow_factory, clock, publisher, concurrency=1)
+    assert await r.run_once() == 1
+    assert len(publisher.published) == 1
+    assert len(store.unpublished()) == 2  # left for the next round, not published blindly
+
+
+async def test_run_forever_exits_after_repeated_failures(uow_factory, store, clock) -> None:
+    """Review P3: a permanently broken loop must take the process down, not idle forever."""
+    from payments.application.relay import BackgroundTaskUnhealthy
+
+    class BrokenUow:
+        def __call__(self):  # type: ignore[no-untyped-def]
+            raise ConnectionError("database down")
+
+    stop = asyncio.Event()
+    r = OutboxRelay(
+        uow_factory=BrokenUow(),
+        publisher=FakePublisher(),
+        clock=clock,
+        lease=LEASE,
+        poll_interval=0.001,
+        max_consecutive_failures=3,
+    )
+    with pytest.raises(BackgroundTaskUnhealthy):
+        await asyncio.wait_for(r.run_forever(stop), 2)
 
 
 async def test_run_forever_stops_and_survives_errors(uow_factory, store, clock) -> None:

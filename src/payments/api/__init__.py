@@ -1,1 +1,1 @@
-"""HTTP entrypoint (FastAPI). Translates HTTP <-> use cases; holds no business rules."""
+"""The HTTP side (FastAPI). Turns requests into use-case calls and results into responses."""

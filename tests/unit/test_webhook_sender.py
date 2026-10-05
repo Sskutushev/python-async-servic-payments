@@ -111,6 +111,45 @@ async def test_policy_rejection_is_permanent_and_never_hits_the_network() -> Non
     assert calls == 0
 
 
+async def test_strict_policy_connects_to_the_checked_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DNS rebinding defence: the request goes to the IP we approved, with the original Host/SNI."""
+    import asyncio
+
+    async def fake_getaddrinfo(*_: object, **__: object) -> list[tuple]:  # type: ignore[type-arg]
+        return [(0, 0, 0, "", ("93.184.216.34", 0))]
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", fake_getaddrinfo)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(204)
+
+    await sender(handler, WebhookUrlPolicy()).deliver(
+        "https://merchant.example/hooks?x=1", uuid.uuid4(), BODY
+    )
+    [req] = seen
+    assert req.url.host == "93.184.216.34"
+    assert req.url.path == "/hooks"
+    assert req.url.query == b"x=1"
+    assert req.headers["Host"] == "merchant.example"
+    assert req.extensions["sni_hostname"] == "merchant.example"
+
+
+async def test_dev_policy_keeps_hostnames(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(204)
+
+    await sender(handler).deliver("http://webhook-receiver:9000/hooks", uuid.uuid4(), BODY)
+    assert seen[0].url.host == "webhook-receiver"
+    assert "sni_hostname" not in seen[0].extensions
+
+
 async def test_large_response_body_is_not_fully_read() -> None:
     def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"x" * 1_000_000)

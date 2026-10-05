@@ -1,4 +1,5 @@
-"""Operational entrypoints: ``payments api | consumer | migrate | replay <payment_id>``."""
+"""Command line: ``payments api``, ``payments consumer``, ``payments migrate``,
+``payments replay <payment_id>``."""
 
 from __future__ import annotations
 

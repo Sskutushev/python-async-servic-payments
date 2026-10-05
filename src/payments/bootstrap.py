@@ -1,7 +1,7 @@
-"""Composition root shared by the API and the consumer.
+"""Where everything is wired together, for both the API and the consumer.
 
-Builds the long-lived resources (engine, HTTP client) and wires the adapters
-into the use cases. Nothing else in the codebase instantiates adapters.
+Creates the long-lived objects (database engine, HTTP client) and plugs the real
+implementations into the use cases. Nothing else in the code base creates those objects.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from payments.settings import Settings
 @dataclass(slots=True)
 class Container:
     settings: Settings
-    engine: AsyncEngine | None  # None only in tests that run on in-memory persistence
+    engine: AsyncEngine | None  # None only in tests that use the in-memory store
     session_factory: async_sessionmaker[AsyncSession] | None
     uow_factory: UnitOfWorkFactory
     clock: Clock

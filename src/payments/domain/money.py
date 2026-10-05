@@ -1,9 +1,9 @@
-"""Money value object.
+"""Money: an amount plus a currency.
 
-Contract: ``Decimal`` only, never ``float``; strictly positive; at most two
-fractional digits (RUB/USD/EUR are all 2-digit currencies); bounded by the
-``NUMERIC(18, 2)`` column. ``100``, ``100.0`` and ``100.00`` normalize to the same
-value; ``100.001`` is rejected rather than silently rounded.
+Rules: amounts are ``Decimal`` (never ``float``), greater than zero, with at most two
+decimal places (all three supported currencies use two), and small enough for the
+``NUMERIC(18, 2)`` column. ``100``, ``100.0`` and ``100.00`` all mean the same amount;
+``100.001`` is rejected instead of being rounded.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ class Currency(StrEnum):
 
 
 def parse_amount(raw: Decimal | int | str) -> Decimal:
-    """Validate and normalize an amount to exactly two fractional digits."""
+    """Check an amount and return it with exactly two decimal places."""
     if isinstance(raw, bool | float):  # bool is an int subclass; floats are never money
         raise InvalidAmount("amount must be a decimal string or integer")
     try:

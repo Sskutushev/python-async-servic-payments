@@ -1,1 +1,1 @@
-"""AMQP entrypoint (FastStream): topology, publisher adapter and the single consumer."""
+"""The RabbitMQ side (FastStream): queues and exchanges, publishing, and the one consumer."""

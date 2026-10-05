@@ -1,8 +1,7 @@
-"""Outbox events and the broker topology names they target.
+"""Outbox events and the queue/exchange names they go to.
 
-Names live in the domain so that the outbox record is self-describing: the relay
-publishes whatever ``exchange``/``routing_key`` the event carries and knows nothing
-about payment semantics.
+Each outbox row says where it should be published (``exchange`` + ``routing_key``).
+That way the relay just publishes rows and never needs to know what a payment is.
 """
 
 from __future__ import annotations
@@ -27,8 +26,8 @@ DEAD_LETTER_QUEUE = "payments.dlq"
 
 
 class Phase(StrEnum):
-    PROCESS = "process"  # obtain the gateway result
-    NOTIFY = "notify"  # deliver the webhook
+    PROCESS = "process"  # get the gateway result
+    NOTIFY = "notify"  # send the webhook
 
 
 class EventType(StrEnum):
@@ -88,7 +87,7 @@ def payment_created_event(payment: Payment, *, now: datetime) -> OutboxEvent:
 def payment_retry_event(
     payment: Payment, *, phase: Phase, attempt: int, available_at: datetime, now: datetime
 ) -> OutboxEvent:
-    """Durable retry: the message re-enters ``payments.new`` once ``available_at`` passes."""
+    """A retry stored in the database. It is published to ``payments.new`` at ``available_at``."""
     event_id = uuid.uuid4()
     return OutboxEvent(
         id=event_id,
@@ -108,7 +107,7 @@ def payment_retry_event(
 def payment_recovery_event(
     payment: Payment, *, phase: Phase, now: datetime, reason: str
 ) -> OutboxEvent:
-    """Emitted by the recovery scan for work that lost its in-flight message."""
+    """Created by the recovery scan when a payment's message was lost (e.g. a worker crashed)."""
     event_id = uuid.uuid4()
     return OutboxEvent(
         id=event_id,
@@ -134,7 +133,7 @@ def payment_dead_letter_event(
     original_event_id: uuid.UUID | None,
     now: datetime,
 ) -> OutboxEvent:
-    """Technical failure envelope for operators. Never contains secrets or the webhook URL."""
+    """Message for the dead-letter queue, read by operators. No secrets, no webhook URL inside."""
     event_id = uuid.uuid4()
     return OutboxEvent(
         id=event_id,

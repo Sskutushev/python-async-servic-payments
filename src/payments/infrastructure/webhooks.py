@@ -1,23 +1,30 @@
-"""HTTP webhook sender.
+"""Sends webhooks over HTTP.
 
-Delivery semantics (documented in README):
+How the answer is interpreted:
 
-* 2xx -> delivered.
-* 408, 429, 5xx, timeouts and connection errors -> retryable.
-* any other status, redirects (not followed) and policy rejections -> permanent.
-* ``Retry-After`` (seconds) on 429/503 is honoured up to the retry policy cap.
+* 2xx: delivered.
+* 408, 429, 5xx, timeouts, connection errors: worth retrying.
+* anything else (other 4xx, redirects, URLs our policy rejects): give up, no retry.
+* A ``Retry-After`` header (in seconds) is respected, up to the configured maximum.
+
+Against DNS rebinding: the policy resolves the hostname and approves one public address,
+and the request is sent to that address. The original hostname stays in the ``Host``
+header and in the TLS handshake (SNI + certificate check), so the receiver sees a normal
+request. In dev mode (private networks allowed) hostnames are used as they are.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from datetime import timedelta
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from payments.application.ports import Clock, WebhookDeliveryError
 from payments.infrastructure.signing import canonical_body, sign
-from payments.infrastructure.url_policy import WebhookUrlPolicy, WebhookUrlRejected
+from payments.infrastructure.url_policy import IpAddress, WebhookUrlPolicy, WebhookUrlRejected
 
 RETRYABLE_STATUSES = frozenset({408, 429})
 MAX_RETRY_AFTER = timedelta(hours=1)
@@ -28,9 +35,23 @@ def build_http_client(timeout_seconds: float) -> httpx.AsyncClient:
         timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 3.0)),
         limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
         follow_redirects=False,
-        trust_env=False,  # never pick up proxies from the environment by accident
+        trust_env=False,  # ignore proxy settings from the environment
         headers={"User-Agent": "payments-webhook/1.0"},
     )
+
+
+def pin_to_address(url: str, address: IpAddress) -> tuple[str, dict[str, str]]:
+    """Rewrite ``url`` so it connects to ``address``; return it with the extra request options.
+
+    The returned headers carry the original ``Host``; the ``sni_hostname`` extension makes
+    httpx present and verify the certificate for the original hostname.
+    """
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    literal = f"[{address}]" if isinstance(address, ipaddress.IPv6Address) else str(address)
+    netloc = f"{literal}:{parts.port}" if parts.port else literal
+    pinned = urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
+    return pinned, {"Host": host, "sni_hostname": host}
 
 
 class HttpWebhookSender:
@@ -52,7 +73,7 @@ class HttpWebhookSender:
     async def deliver(self, url: str, event_id: uuid.UUID, body: dict[str, object]) -> None:
         try:
             self._policy.validate(url)
-            await self._policy.check_resolved(url)
+            address = await self._policy.check_resolved(url)
         except WebhookUrlRejected as exc:
             raise WebhookDeliveryError(f"url_rejected:{exc.reason}", retryable=False) from exc
 
@@ -64,12 +85,22 @@ class HttpWebhookSender:
             "X-Webhook-Timestamp": timestamp,
             "X-Webhook-Signature": sign(self._secret, timestamp, raw),
         }
+        extensions: dict[str, object] = {}
+        target = url
+        if address is not None:
+            target, pinned = pin_to_address(url, address)
+            headers["Host"] = pinned["Host"]
+            if target.startswith("https://"):
+                extensions["sni_hostname"] = pinned["sni_hostname"]
+
         try:
-            async with self._client.stream("POST", url, content=raw, headers=headers) as resp:
+            async with self._client.stream(
+                "POST", target, content=raw, headers=headers, extensions=extensions
+            ) as resp:
                 status = resp.status_code
                 retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
-                # Drain a bounded amount of the body so the connection can be reused;
-                # anything beyond the cap is simply not read.
+                # Read a little of the response so the connection can be reused,
+                # but never more than the cap: a huge response must not hurt us.
                 received = 0
                 async for chunk in resp.aiter_bytes():
                     received += len(chunk)

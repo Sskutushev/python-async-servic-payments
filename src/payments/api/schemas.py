@@ -1,5 +1,8 @@
-"""Request/response contracts. Amount contract: decimal *string* or integer; JSON floats
-are rejected because binary floats cannot represent money exactly."""
+"""Shapes of requests and responses.
+
+Amounts must be a decimal string (``"100.00"``) or an integer. JSON floats are refused
+because a float cannot represent money exactly (0.1 + 0.2 is not 0.3).
+"""
 
 from __future__ import annotations
 
@@ -76,8 +79,12 @@ class PaymentResponse(BaseModel):
     status: PaymentStatus
     failure_code: str | None
     webhook_url: str
+    processing_halt_reason: str | None = Field(
+        description="Set when the gateway could not be reached and an operator must replay"
+    )
     notification_status: NotificationStatus
     notification_attempts: int
+    notification_last_error: str | None
     created_at: datetime
     processed_at: datetime | None
 
@@ -92,8 +99,10 @@ class PaymentResponse(BaseModel):
             status=payment.status,
             failure_code=payment.failure_code,
             webhook_url=payment.webhook_url,
+            processing_halt_reason=payment.processing_halt_reason,
             notification_status=payment.notification_status,
             notification_attempts=payment.notification_attempts,
+            notification_last_error=payment.notification_last_error,
             created_at=payment.created_at,
             processed_at=payment.processed_at,
         )

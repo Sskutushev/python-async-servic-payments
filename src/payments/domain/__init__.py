@@ -1,1 +1,1 @@
-"""Pure business rules. No framework, ORM, HTTP or AMQP imports here."""
+"""Business rules only: money, payment states, events. No database, HTTP or broker code here."""

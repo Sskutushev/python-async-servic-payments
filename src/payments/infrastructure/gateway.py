@@ -1,8 +1,8 @@
-"""Simulated payment gateway: 2-5 s latency, ~90 % success.
+"""A pretend payment gateway: waits 2-5 seconds and approves about 90 % of payments.
 
-The outcome is a deterministic function of ``(seed, payment_id)`` so that a
-redelivered message for the same payment cannot flip a decline into a success.
-Sleep and the delay source are injectable: tests never wait for real time.
+The answer depends only on the secret seed and the payment id, so asking twice about
+the same payment always gives the same answer: a retry can never turn a decline into a
+success. The ``sleep`` function can be replaced, so tests do not wait for real time.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ class SimulatedGateway:
 
     def _roll(self, payment: Payment) -> float:
         digest = hmac.new(self._seed, payment.id.bytes, hashlib.sha256).digest()
-        return int.from_bytes(digest[:8], "big") / 2**64  # uniform in [0, 1)
+        return int.from_bytes(digest[:8], "big") / 2**64  # a stable number between 0 and 1
 
     async def charge(self, payment: Payment) -> GatewayOutcome:
         delay = random.Random(payment.id.int).uniform(self._min_delay, self._max_delay)

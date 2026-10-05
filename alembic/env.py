@@ -1,4 +1,4 @@
-"""Async Alembic environment. The URL comes from ``DATABASE_URL`` (never from alembic.ini)."""
+"""Alembic setup for the async engine. The database URL always comes from ``DATABASE_URL``."""
 
 from __future__ import annotations
 

@@ -1,4 +1,7 @@
-"""Webhook signing: ``X-Webhook-Signature: v1=<hex HMAC-SHA256(secret, "<ts>.<body>")>``."""
+"""Signing webhooks so the receiver can check they really came from us.
+
+Header: ``X-Webhook-Signature: v1=<hex>`` where ``hex = HMAC-SHA256(secret, "<timestamp>.<body>")``.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +13,7 @@ SIGNATURE_VERSION = "v1"
 
 
 def canonical_body(body: dict[str, object]) -> bytes:
-    """Stable byte representation so every retry signs exactly the same payload."""
+    """Same data, same bytes (sorted keys, no spaces): every retry signs exactly the same thing."""
     return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 

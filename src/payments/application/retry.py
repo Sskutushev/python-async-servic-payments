@@ -1,6 +1,7 @@
-"""Retry budget: ``max_attempts`` total (initial + retries), exponential delay between them.
+"""How many times we try and how long we wait in between.
 
-With defaults 3 / 1s / x2: attempt 1 now, attempt 2 after 1s, attempt 3 after 2s.
+``max_attempts`` counts the first try too. With the defaults (3 attempts, 1 s, x2):
+attempt 1 now, attempt 2 after 1 s, attempt 3 after 2 s.
 """
 
 from __future__ import annotations
@@ -26,7 +27,11 @@ class RetryPolicy:
         return attempts_made >= self.max_attempts
 
     def delay_before(self, next_attempt: int, *, retry_after: timedelta | None = None) -> timedelta:
-        """Delay before ``next_attempt`` (1-based). ``Retry-After`` is honoured within the cap."""
+        """How long to wait before attempt number ``next_attempt`` (counting from 1).
+
+        If the receiver asked for a longer wait via ``Retry-After``, we use that, but
+        never more than ``max_delay``.
+        """
         if next_attempt < 2:
             raise ValueError("delay applies to attempts >= 2")
         backoff = self.base_delay * (self.multiplier ** (next_attempt - 2))

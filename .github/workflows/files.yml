@@ -1,0 +1,38 @@
+# Gate 4 — Files: is the repository itself in order? Lockfile in sync, config files valid,
+# migrations linear, nothing committed that should not be.
+name: files
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  repository:
+    name: repository hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: lockfile matches pyproject.toml
+        run: uv lock --check
+      - run: uv sync --all-groups
+      - name: forbidden files, valid YAML/TOML/JSON, line endings, file sizes
+        run: uv run python tools/check_repo.py
+      - name: single migration head
+        run: |
+          heads=$(uv run alembic heads | wc -l)
+          echo "migration heads: $heads"
+          test "$heads" -eq 1
+      - name: compose file is valid
+        run: docker compose --profile demo config -q
+      - name: pre-commit hooks pass on every file
+        run: uv run pre-commit run --all-files --show-diff-on-failure

@@ -1,5 +1,5 @@
-"""Cross-cutting HTTP concerns: API-key auth on *every* route (docs and health included),
-request ids, body size limit, access log."""
+"""Things that apply to every HTTP request: the API key check (docs and health included),
+request ids, the request body size limit and the access log."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ API_KEY_HEADER = b"x-api-key"
 
 
 class ApiKeyMiddleware:
-    """Pure ASGI (not BaseHTTPMiddleware) so streaming and contextvars behave."""
+    """Written as plain ASGI (not BaseHTTPMiddleware) so streaming and context variables work."""
 
     def __init__(self, app: ASGIApp, *, api_key: str) -> None:
         self._app = app
@@ -37,7 +37,7 @@ class ApiKeyMiddleware:
 
 
 class RequestContextMiddleware:
-    """Assigns/propagates ``X-Request-Id``, logs the access line, enforces the body cap."""
+    """Gives each request an ``X-Request-Id``, writes the access log, limits the body size."""
 
     def __init__(self, app: ASGIApp, *, max_body_bytes: int) -> None:
         self._app = app

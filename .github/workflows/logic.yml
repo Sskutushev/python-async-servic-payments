@@ -1,4 +1,5 @@
-name: ci
+# Gate 2 — Logic: does the service behave correctly, alone and with real dependencies?
+name: logic
 
 on:
   push:
@@ -12,38 +13,23 @@ env:
   UV_FROZEN: "1"
 
 jobs:
-  static:
-    name: lint · types · security
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.12"
-      - run: uv sync --all-groups
-      - run: uv run ruff format --check src tests alembic tools
-      - run: uv run ruff check src tests alembic tools
-      - run: uv run mypy
-      - run: uv run bandit -q -c pyproject.toml -r src
-      - run: uv run pip-audit --strict
-
   unit:
-    name: unit · property
+    name: unit + property tests (no services)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
       - run: uv sync --all-groups
-      - run: uv run pytest tests/unit -q --cov --cov-report=xml
+      - run: uv run pytest tests/unit -q --cov --cov-report=xml --cov-report=term --cov-fail-under=85
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-unit
           path: coverage.xml
 
   integration:
-    name: postgres · rabbitmq
+    name: integration (real PostgreSQL + RabbitMQ)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -67,20 +53,20 @@ jobs:
       TEST_DATABASE_URL: postgresql+asyncpg://payments:payments@127.0.0.1:5432/payments_test
       TEST_RABBITMQ_URL: amqp://payments:payments@127.0.0.1:5672/
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
       - run: uv sync --all-groups
-      - run: uv run pytest tests/integration tests/rabbit -q --cov --cov-report=term-missing --cov-fail-under=0
+      - run: uv run pytest tests/integration tests/rabbit -q
 
   e2e:
-    name: docker compose e2e
+    name: end-to-end (docker compose)
     runs-on: ubuntu-latest
-    needs: [static, unit]
+    needs: [unit]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
       - run: uv sync --all-groups

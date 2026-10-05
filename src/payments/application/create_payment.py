@@ -1,12 +1,12 @@
-"""Create a payment idempotently and enqueue its outbox event in the same transaction.
+"""Create a payment once, no matter how many times the same request arrives.
 
-Concurrency model (READ COMMITTED):
+How it works when several identical requests race each other:
 
-1. ``INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`` — exactly one of N
-   concurrent requests wins; the winner also inserts the initial outbox event
-   before committing, so "payment exists" implies "event will be published".
-2. Losers re-read the committed winner and compare fingerprints: same body ->
-   same ``payment_id``; different body -> :class:`IdempotencyConflict`.
+1. Each one tries ``INSERT ... ON CONFLICT (idempotency_key) DO NOTHING``. Exactly one
+   insert succeeds. That request also writes the outbox event in the same transaction,
+   so if the payment exists, its event is guaranteed to exist too.
+2. The others read the payment that won and compare request fingerprints: same body ->
+   they return the same ``payment_id``; different body -> ``IdempotencyConflict`` (409).
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ class CreatePaymentCommand:
 @dataclass(frozen=True, slots=True)
 class CreatePaymentResult:
     payment: Payment
-    created: bool  # False => replay of an earlier request with the same key
+    created: bool  # False means this is a repeat of an earlier request with the same key
 
 
 class CreatePayment:
@@ -73,9 +73,9 @@ class CreatePayment:
                 await uow.commit()
                 return CreatePaymentResult(payment=candidate, created=True)
 
-            # A concurrent/earlier request owns this key; it is committed and visible now.
+            # Someone else already created a payment with this key; it is committed by now.
             existing = await uow.payments.get_by_idempotency_key(command.idempotency_key)
-            if existing is None:  # pragma: no cover - defensive: winner cannot vanish
+            if existing is None:  # pragma: no cover - cannot happen: rows are never deleted
                 raise IdempotencyConflict("idempotency key owner not found")
             if existing.request_fingerprint != fingerprint:
                 raise IdempotencyConflict(

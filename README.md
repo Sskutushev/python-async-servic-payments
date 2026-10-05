@@ -2,37 +2,37 @@
 
 FastAPI · Pydantic v2 · SQLAlchemy 2.0 (async) · PostgreSQL · RabbitMQ (FastStream) · Alembic · Docker Compose
 
-`POST /api/v1/payments` stores a payment **and** its outbox event in one transaction and
-answers `202` at once. A single consumer charges a simulated gateway (2–5 s, ~90 % success),
-stores the result and delivers a signed webhook — with three counted attempts, exponential
-backoff and a dead-letter queue. Everything is idempotent: the same request, the same
-message or the same crash replayed twice converges to the same state.
+A client sends a payment. The API saves it and answers `202` right away. A background consumer
+then charges a (simulated) payment gateway, saves the result and sends a signed webhook to the
+client. Nothing is lost on the way and nothing is done twice: the same request, the same
+message or the same crash replayed again always ends in the same state.
 
 ```
-            ┌──────────┐  1 tx: payments + outbox   ┌──────────────┐
- client ───►│   api    │───────────────────────────►│  PostgreSQL  │◄───────────────┐
-   ▲        └──────────┘                            └──────┬───────┘                │
-   │ 202 / GET                                             │ outbox relay            │ checkpointed
-   │                                                       ▼ (confirms, mandatory)   │ stages
-   │                                                ┌──────────────┐          ┌──────┴──────┐
-   │                                                │   RabbitMQ   │ ───────► │  consumer   │──► gateway (sim)
-   │                                                │ payments.new │          │  (1 handler)│──► webhook (HMAC)
- webhook ◄──────────────────────────────────────────│ payments.dlq │ ◄─────── └─────────────┘
+            ┌──────────┐  one transaction: payment + event  ┌──────────────┐
+ client ───►│   api    │───────────────────────────────────►│  PostgreSQL  │◄──────────────┐
+   ▲        └──────────┘                                    └──────┬───────┘               │
+   │ 202 / GET                                                     │ outbox relay           │ saves progress
+   │                                                               ▼ (waits for confirm)    │ after every step
+   │                                                        ┌──────────────┐        ┌───────┴───────┐
+   │                                                        │   RabbitMQ   │ ─────► │   consumer    │──► gateway (simulated)
+   │                                                        │ payments.new │        │  one handler  │──► webhook (signed)
+ webhook ◄──────────────────────────────────────────────────│ payments.dlq │ ◄───── └───────────────┘
 ```
 
-## Quick start
+## Run it
 
 ```bash
 cp .env.example .env            # demo secrets; change them for anything shared
 docker compose --profile demo up --build -d --wait
 ```
 
-Services: `postgres`, `rabbitmq` (management UI on http://127.0.0.1:15672, `payments`/`payments`),
-`migrate` (one-shot `alembic upgrade head`), `api` (http://127.0.0.1:8000), `consumer`
-(handler + outbox relay + recovery scan) and, in the `demo` profile, `webhook-receiver`
-(http://127.0.0.1:9000) which verifies signatures and can be told to fail.
+What starts: `postgres`, `rabbitmq` (management UI: http://127.0.0.1:15672, `payments` /
+`payments`), `migrate` (runs the migrations once), `api` (http://127.0.0.1:8000), `consumer`
+(the handler plus the outbox relay and the recovery scan) and, in the `demo` profile,
+`webhook-receiver` (http://127.0.0.1:9000) — a small server that checks signatures and can be
+told to fail on purpose.
 
-### Create and read a payment
+### Create a payment and read it back
 
 ```bash
 export API_KEY=demo-api-key-change-me-please
@@ -41,206 +41,236 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/payments \
   -H "X-API-Key: $API_KEY" -H "Idempotency-Key: order-42" -H "Content-Type: application/json" \
   -d '{"amount":"100.00","currency":"USD","description":"order 42",
        "metadata":{"order_id":42},"webhook_url":"http://webhook-receiver:9000/hooks"}'
-# 202 {"payment_id":"…","status":"pending","created_at":"…"}   Location: /api/v1/payments/…
+# 202 {"payment_id":"…","status":"pending","created_at":"…"}    Location: /api/v1/payments/…
 
 curl -s http://127.0.0.1:8000/api/v1/payments/<payment_id> -H "X-API-Key: $API_KEY"
-# {"payment_id":"…","amount":"100.00","currency":"USD","status":"succeeded",
-#  "failure_code":null,"notification_status":"delivered","notification_attempts":1,
-#  "processed_at":"…","created_at":"…",…}
+# {"payment_id":"…","amount":"100.00","currency":"USD","status":"succeeded","failure_code":null,
+#  "notification_status":"delivered","notification_attempts":1,"processed_at":"…",…}
 
-curl -s http://127.0.0.1:9000/received     # what the demo receiver got (signature-verified)
+curl -s http://127.0.0.1:9000/received      # what the demo receiver got (signature verified)
 ```
 
-OpenAPI: http://127.0.0.1:8000/docs (needs the `X-API-Key` header too — every endpoint does).
+API docs: http://127.0.0.1:8000/docs — the `X-API-Key` header is needed there too, like
+everywhere else.
 
-### Scripted demos
+### Watch the interesting cases
 
 ```bash
 uv run python tools/demo.py --scenario happy    # 202 → consumer → signed webhook → GET
 uv run python tools/demo.py --scenario replay   # same key → same id; different body → 409
-uv run python tools/demo.py --scenario retry    # receiver fails twice → delivered on 3rd, charged once
-uv run python tools/demo.py --scenario dlq      # receiver always fails → exhausted + DLQ, result kept
-docker compose run --rm api replay <payment_id> # operator replay of the failed phase only
+uv run python tools/demo.py --scenario retry    # receiver fails twice → delivered on the 3rd try, charged once
+uv run python tools/demo.py --scenario dlq      # receiver always fails → exhausted + DLQ, result is kept
+docker compose run --rm api replay <payment_id> # operator: retry only the step that failed
+docker compose --profile demo logs -f consumer webhook-receiver
 ```
 
-Watch it happen: `docker compose --profile demo logs -f consumer webhook-receiver`.
-
-## API contract
+## The API
 
 | | |
 |---|---|
-| Auth | `X-API-Key` on **all** routes (docs, health included), constant-time compare → `401` |
-| `POST /api/v1/payments` | `Idempotency-Key` header required: 1–128 printable ASCII. Body: `amount`, `currency` (`RUB`/`USD`/`EUR`), `description` (≤1000), `metadata` (JSON object ≤16 KiB), `webhook_url`. Request body ≤32 KiB. |
-| `amount` | Decimal **string** (`"100.00"`) or integer. JSON floats are rejected (`422`), as are >2 fractional digits, zero, negatives, NaN/∞ and values above `NUMERIC(18,2)`. `100`, `"100"`, `"100.0"` are the same amount. |
-| `202` | `{payment_id, status, created_at}` + `Location` + `Idempotency-Replayed: true|false` |
-| Replay | Same key + semantically same body → `202` with the original `payment_id` and current status |
-| Conflict | Same key + different body → `409 idempotency_conflict` (fingerprint = SHA-256 of the normalized payload, key order irrelevant) |
-| `GET /api/v1/payments/{id}` | Full details incl. `failure_code`, `notification_status`, `notification_attempts`, `processed_at`; `404` otherwise |
-| Errors | Always `{"error": {"code", "message", "request_id", "details"?}}`; `413` body too large, `422` validation, `503` infrastructure |
-| Correlation | `X-Request-Id` echoed/assigned on every response and present in JSON logs |
+| Authentication | `X-API-Key` on **every** route, docs and health included. Wrong or missing key → `401`. |
+| `POST /api/v1/payments` | Header `Idempotency-Key` (required, 1–128 printable ASCII characters). Body: `amount`, `currency` (`RUB`, `USD`, `EUR`), `description` (≤ 1000 chars), `metadata` (JSON object ≤ 16 KiB), `webhook_url`. Whole body ≤ 32 KiB. |
+| `amount` | A decimal **string** (`"100.00"`) or an integer. JSON floats are refused (`422`) — floats cannot hold money exactly. Also refused: more than 2 decimals, zero, negatives, NaN, values above `NUMERIC(18,2)`. `100`, `"100"` and `"100.0"` are the same amount. |
+| Response `202` | `{payment_id, status, created_at}` plus headers `Location` and `Idempotency-Replayed: true|false`. |
+| Same key again | Same body → `202` with the original `payment_id` and the current status. Different body → `409 idempotency_conflict`. "Same body" is decided by a hash of the cleaned-up values, so key order and `100` vs `100.00` do not matter. |
+| `GET /api/v1/payments/{id}` | All details, including `failure_code`, `notification_status`, `notification_attempts`, `notification_last_error`, `processing_halt_reason`, `processed_at`. Unknown id → `404`. |
+| Errors | Always `{"error": {"code", "message", "request_id", "details"?}}`. `413` body too large, `422` validation, `503` the database is unavailable. |
+| Tracing | `X-Request-Id` is accepted or generated, returned on every response and written into every log line. |
 
-## Webhook contract
+## The webhook
 
-Body (canonical JSON, frozen when the result is stored, byte-identical on every retry):
+Body — canonical JSON, built once when the result is saved, identical bytes on every attempt:
 
 ```json
 {"event_id":"…","event_type":"payment.succeeded","schema_version":1,"payment_id":"…",
  "amount":"100.00","currency":"USD","status":"succeeded","failure_code":null,"occurred_at":"…"}
 ```
 
-Headers: `X-Webhook-Id` (= `event_id`, stable across retries — **de-duplicate on it**),
-`X-Webhook-Timestamp` (unix seconds of this delivery), `X-Webhook-Signature: v1=<hex>` where
-`hex = HMAC-SHA256(WEBHOOK_SECRET, "<timestamp>.<raw body>")`. See `tools/webhook_receiver.py`
-for a reference verifier (constant-time compare, 5-minute window, dedup).
+Headers: `X-Webhook-Id` (= `event_id`, the same on every attempt — **de-duplicate on it**),
+`X-Webhook-Timestamp` (unix seconds of this attempt), `X-Webhook-Signature: v1=<hex>` where
+`hex = HMAC-SHA256(WEBHOOK_SECRET, "<timestamp>.<raw body>")`. `tools/webhook_receiver.py`
+shows how to verify it (constant-time compare, 5-minute window, de-duplication by id).
 
-Classification: `2xx` delivered · `408/429/5xx`/timeout/connection error → retry (`Retry-After`
-honoured up to the cap) · any other status or redirect → permanent failure → DLQ.
+How answers are read: `2xx` delivered · `408`, `429`, `5xx`, timeout, connection error → retry
+(`Retry-After` is respected up to a cap) · anything else, including redirects → give up.
 
-## Guarantees — and their limits
+## What is guaranteed, and what is not
 
-| Scenario | What happens | Proof |
+| Situation | What happens | Where it is proven |
 |---|---|---|
-| 20 concurrent `POST` with one key | one row, one outbox event, 20 × `202` with the same id | `tests/integration/test_idempotency_pg.py` |
-| RabbitMQ down while `POST`ing | API still answers `202`; relay catches up when the broker returns | outbox + `test_relay.py` |
-| Relay crashes between publish and mark | event re-published with the same `event_id`; consumer ignores it | `test_relay.py::test_lost_lease…` |
-| Payment `succeeded`, webhook `500` | retry scheduled (1 s, then 2 s); **gateway never called again** | `test_process_payment.py::test_webhook_failure_never_reprocesses_the_payment` |
-| Third webhook attempt fails | `notification_status=exhausted`, DLQ message; payment **stays** `succeeded`/`failed` | `…::test_third_failed_attempt_exhausts_and_dead_letters` |
-| Consumer crashes after result, before webhook | redelivery resumes at the webhook stage | `…::test_crash_after_result_before_webhook…` |
-| Consumer crashes after receiver accepted, before commit | the same `event_id` is delivered again (at-least-once) | `…::test_crash_after_webhook_accepted…` |
-| Two workers get the same message | processing lease: one charges, the other skips; stale lease cannot overwrite | `…::test_stale_worker…`, `test_process_payment_pg.py::test_concurrent_duplicates_charge_once` |
-| Gateway unreachable 3× | payment stays `pending` (unknown ≠ declined), DLQ for operators | `…::test_gateway_unreachable_three_times…` |
-| Unknown payment / malformed message | rejected → broker dead-letters to `payments.dlq` | `tests/rabbit/test_broker.py` |
-| `webhook_url` → loopback / RFC 1918 / metadata IP / userinfo / http | `422` at creation, permanent failure at delivery | `test_url_policy.py`, `test_api.py` |
+| 20 identical `POST`s at the same time | one payment, one event, every request gets `202` with the same id | `tests/integration/test_idempotency_pg.py` |
+| RabbitMQ is down while clients `POST` | the API still answers `202`; the relay catches up when the broker is back | outbox design, `tests/unit/test_relay.py` |
+| Relay crashes between "published" and "marked" | the event is published again with the same id; the consumer ignores the duplicate | `test_relay.py::test_lost_lease…` |
+| Payment succeeded, webhook answers `500` | retry after 1 s, then 2 s; **the gateway is not called again** | `test_process_payment.py::test_webhook_failure_never_reprocesses_the_payment` |
+| Third webhook attempt fails too | `notification_status = exhausted`, a message in `payments.dlq`; the payment **stays** `succeeded` / `failed` | `…::test_third_failed_attempt_exhausts_and_dead_letters` |
+| Worker dies after saving the result, before the webhook | the redelivered message continues at the webhook step | `…::test_crash_after_result_before_webhook…` |
+| Worker dies during the 1st or 2nd webhook attempt | the attempt is counted; the recovery scan continues with the next one | `…::test_crash_during_early_webhook_attempt…` |
+| Worker dies during the **3rd** webhook attempt | no 4th call: the payment goes to an operator as `delivery_outcome_unknown_after_budget` | `…::test_crash_during_third_webhook_attempt…`, `tests/integration/test_recovery_budget_pg.py` |
+| Two workers get the same message | one charges, the other skips; a worker whose reservation expired cannot write anything — not a result, not a retry | `…::test_stale_worker…`, `test_recovery_budget_pg.py` |
+| Two webhook attempts overlap | the late outcome of the old attempt is ignored; the newer record wins | `…::test_late_outcome_of_a_stale_webhook_attempt…`, `test_recovery_budget_pg.py` |
+| Gateway unreachable three times | the payment stays `pending` (unknown ≠ declined), is **halted** and goes to the DLQ; duplicates and the recovery scan never trigger a 4th call | `…::test_halted_payment_is_never_charged_again_until_replay`, `test_recovery_budget_pg.py` |
+| Operator runs `replay` | only then a new set of three attempts opens, for the failed step only, with the same webhook event id | `tests/unit/test_recovery_and_replay.py` |
+| Broken message or unknown payment id | rejected; RabbitMQ moves it to `payments.dlq` | `tests/rabbit/test_broker.py` |
+| `webhook_url` points at localhost, a private network, the cloud metadata IP, has credentials, uses `http` | `422` at creation; refused again at send time | `test_url_policy.py`, `test_api.py` |
+| DNS answer changes between check and connection | we connect to the address we checked, with the original hostname for TLS and `Host` | `test_webhook_sender.py::test_strict_policy_connects_to_the_checked_address` |
 
-**Delivery semantics are at-least-once with idempotent processing, not exactly-once**
-(ADR-0001). The service never charges a payment twice; a webhook can arrive twice with the
-same `X-Webhook-Id`. "3 attempts" means three *counted* attempts in total (initial + 2 retries),
-counted before the HTTP call, so a crash mid-flight still consumes budget. "Unknown" is a
-distinct state from "declined": infrastructure failures never turn a payment into `failed`.
+In short: **at least once, and every step is safe to repeat** (ADR-0001). The simulated gateway
+is never charged twice for one payment. A webhook can arrive twice with the same id, but it is
+never sent more than three counted times without an operator's replay. "Three attempts" means
+three in total, counted *before* each call, so a crash during a call still counts. "Unknown" is a
+separate state from "declined": an outage never turns a payment into `failed`.
 
-## Retry, DLQ and recovery (ADR-0002, ADR-0003)
+What a real gateway would need on top: send `payment.id` as the provider's idempotency key and
+add a status lookup for the "we charged but lost the answer" case. The `PaymentGateway`
+interface says so; the simulator does not need it because its answer depends only on the id.
 
-* Retries are **outbox rows** (`payment.retry`, `available_at = now + base·2^(n-2)`) written in
-  the same transaction as the attempt counter; the relay re-publishes them to `payments.new`.
-  Default budget: 3 attempts, delays 1 s and 2 s, cap 60 s (`RETRY_*` settings).
-* Exhaustion writes a `payment.dead_letter` outbox row routed to exchange `payments.dead` →
-  queue `payments.dlq` with `{payment_id, phase, counted_attempts, failure_code, …}` — never
-  the webhook URL or secrets. `payments.new` also has broker-level DLX to the same queue for
-  rejected (poison) messages.
-* The recovery scan (every `RECOVERY_INTERVAL_SECONDS`) re-enqueues payments whose in-flight
-  message was lost: expired processing leases and webhook attempts that never recorded an
-  outcome — only when no unpublished outbox row exists, so nothing is scheduled twice.
-* `payments replay <payment_id>` reopens an exhausted notification (fresh budget, **same**
-  `event_id`) or re-queues a `pending` payment after a gateway outage. It never re-charges a
-  payment with a stored result.
+## Retries, dead letters, recovery (ADR-0002, ADR-0003)
+
+* A retry is a row in the outbox, written in the same transaction as the attempt counter.
+  The relay publishes it back to `payments.new` when it is due. Default: 3 attempts, delays
+  1 s and 2 s, cap 60 s (`RETRY_*`).
+* After the last attempt the same transaction writes a `payment.dead_letter` row that is
+  routed to `payments.dead` → `payments.dlq`. It contains `payment_id`, `phase`,
+  `counted_attempts`, `failure_code` — never the webhook URL or any secret.
+* The budget is checked **before** every call. If a worker died right after counting the
+  last attempt, the next worker does not call again; it hands the payment to an operator.
+* A halted payment or an exhausted webhook is left alone by everything automatic. The
+  recovery scan skips it, duplicate messages do nothing. `payments replay <id>` is the only
+  way to continue, and it retries just the failed step.
+* The recovery scan (every `RECOVERY_INTERVAL_SECONDS`) finds payments whose message was
+  lost — an expired processing reservation, or a webhook attempt that never recorded its
+  outcome — and only when no outbox event is already waiting for them.
 
 ## Data model
 
-`payments` (one row, two state machines, enforced by `CHECK`s):
+One table for payments, one for the outbox, as the task asks. Two migrations
+(`alembic/versions/`); a test checks that the ORM and the migrated schema match and that
+downgrade/upgrade round-trips.
+
+`payments`:
 
 | group | columns |
 |---|---|
 | business | `id`, `amount NUMERIC(18,2)`, `currency`, `description`, `metadata JSONB`, `status`, `idempotency_key UNIQUE`, `request_fingerprint`, `webhook_url`, `created_at`, `processed_at`, `gateway_reference`, `failure_code` |
-| processing | `gateway_attempts`, `processing_lease_token`, `processing_lease_until` |
-| notification | `notification_status (not_ready→pending→delivered\|exhausted)`, `notification_event_id UNIQUE`, `notification_body` (frozen), `notification_attempts`, `notification_next_attempt_at`, `notification_delivered_at`, `notification_last_error` |
+| processing | `gateway_attempts`, `processing_lease_token`, `processing_lease_until`, `processing_halted_at`, `processing_halt_reason` |
+| notification | `notification_status` (`not_ready → pending → delivered | exhausted`), `notification_event_id UNIQUE`, `notification_body` (frozen), `notification_attempts`, `notification_lease_token`, `notification_next_attempt_at`, `notification_delivered_at`, `notification_last_error` |
 
-`outbox`: `id` (= event id), `event_type`, `schema_version`, `aggregate_id → payments`, `exchange`,
-`routing_key`, `payload JSONB`, `dedup_key UNIQUE`, `created_at`, `available_at`, `published_at`,
-`lease_token`, `lease_until`, `publication_attempts`, `last_error`. Partial indexes cover the only
-hot queries (unpublished by `available_at`; unpublished by aggregate; pending work by time).
+`CHECK` constraints make impossible states impossible: a final status needs `processed_at`,
+a pending one cannot have a webhook, a halt needs a reason and only applies while pending.
 
-Migrations: `alembic/versions/0001_payments_and_outbox.py`; a test asserts the ORM metadata and
-the migrated schema have no drift and that downgrade/upgrade round-trips.
+`outbox`: `id` (= event id), `event_type`, `schema_version`, `aggregate_id → payments`,
+`exchange`, `routing_key`, `payload JSONB`, `dedup_key UNIQUE`, `created_at`, `available_at`,
+`published_at`, `lease_token`, `lease_until`, `publication_attempts`, `last_error`.
 
-## Broker topology
+## RabbitMQ
 
 ```
-exchange payments.events (direct, durable) ─payments.new─► queue payments.new (durable, DLX → payments.dead)
+exchange payments.events (direct, durable) ─payments.new─►    queue payments.new (durable, dead-letters to payments.dead)
 exchange payments.dead   (direct, durable) ─payments.failed─► queue payments.dlq (durable)
 ```
 
-Publishing: persistent delivery mode, publisher confirms, `mandatory=true` with returns raised —
-an unroutable message is never marked published. Consuming: manual acks, prefetch
-`CONSUMER_PREFETCH` (8), ACK only after commit, NACK+requeue on infrastructure errors, REJECT
-(→ DLQ) for poison.
+Publishing: persistent messages, publisher confirms, `mandatory` with returns raised — a
+message no queue accepts is never marked as published. Consuming: manual acknowledgements,
+prefetch `CONSUMER_PREFETCH` (8), ACK after commit, NACK + requeue if our own infrastructure
+fails, REJECT (→ DLQ) for broken messages.
 
 ## Security (ADR-0004)
 
-* Static API key on every route; `hmac.compare_digest`; never echoed in errors or logs.
-* Webhook URL policy: `https` only (http in dev), no userinfo/fragment, ports 80/443, no IP
-  literals, no `localhost`, optional host allow-list; at delivery all resolved addresses must be
-  public (IPv4-mapped IPv6, CGNAT, link-local, multicast covered). No redirects, no env proxies,
-  bounded response read, explicit timeouts, bounded connection pool.
-* `APP_ENV=prod` refuses to start with `WEBHOOK_ALLOW_PRIVATE_NETWORKS` / `…INSECURE_HTTP`.
-* Secrets are `SecretStr`; JSON logs emit a fixed allow-list of fields (no bodies, no URLs with
-  query strings, no keys).
-* Request body cap, metadata cap, description cap; `extra="forbid"` on input models.
-* Non-root container, pinned `uv.lock`, `bandit` + `pip-audit` in CI.
-* Known limit: DNS rebinding between resolution and connect is not prevented in-process.
+* Static API key on every route, constant-time compare, never echoed in errors or logs.
+* Webhook URL policy: `https` only (`http` in dev), no credentials, ports 80/443, no IP
+  addresses, no `localhost`, optional allow-list; before sending, every resolved address
+  must be public, and the request goes to that checked address (DNS rebinding is closed).
+  No redirects, no environment proxies, bounded response read, explicit timeouts.
+* `APP_ENV=prod` refuses to start with the dev flags or with demo-looking secrets.
+* Secrets are `SecretStr`; logs contain only an allow-listed set of fields.
+* Body, metadata and description size caps; unknown JSON fields are rejected.
+* Non-root container; pinned `uv.lock`; `bandit`, `pip-audit`, `gitleaks`, CodeQL, Trivy and
+  hadolint in CI.
 
 ## Configuration
 
-All settings are environment variables validated at startup (`src/payments/settings.py`);
-see `.env.example`. Notables: `API_KEY`, `WEBHOOK_SECRET` (≥16 chars), `DATABASE_URL`,
-`RABBITMQ_URL`, `WEBHOOK_ALLOWED_HOSTS`, `GATEWAY_*` (delay range, success rate, seed),
-`RETRY_*`, `PROCESSING_LEASE_SECONDS`, `OUTBOX_*`, `RECOVERY_*`, `CONSUMER_PREFETCH`.
+Everything comes from environment variables and is validated at start-up
+(`src/payments/settings.py`, `.env.example`). The important ones: `API_KEY`, `WEBHOOK_SECRET`
+(≥ 16 chars), `DATABASE_URL`, `RABBITMQ_URL`, `WEBHOOK_ALLOWED_HOSTS`, `GATEWAY_*` (delay range,
+success rate, seed), `RETRY_*`, `PROCESSING_LEASE_SECONDS`, `OUTBOX_*`, `RECOVERY_*`,
+`CONSUMER_PREFETCH`, `BACKGROUND_MAX_CONSECUTIVE_FAILURES`.
 
-The simulated gateway's outcome is a deterministic function of `(seed, payment_id)`: a
-redelivered message cannot turn a decline into a success.
+The simulated gateway answers deterministically for a given `(seed, payment_id)`, so a repeated
+message cannot turn a decline into a success.
 
-## Project layout
+### Production-style run
+
+`docker-compose.yml` is a **demo**: default credentials, ports on `127.0.0.1`, dev flags on
+(the demo receiver lives on the private network). For a production-style run:
+
+```bash
+API_KEY=… WEBHOOK_SECRET=… GATEWAY_SEED=… POSTGRES_PASSWORD=… RABBITMQ_PASSWORD=… \
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+```
+
+The overlay sets `APP_ENV=prod`, requires every secret, publishes no database or broker ports
+and has no demo receiver. The service itself refuses to start with a demo value in any secret.
+
+## Layout
 
 ```
 src/payments/
-  domain/         money, payment aggregate (state machines, lease), outbox events, fingerprint — no I/O
-  application/    use cases: create_payment, process_payment (stages), relay, recovery, replay, retry policy, ports
+  domain/         money, the Payment (two state machines, leases, halt), outbox events, fingerprint — no I/O
+  application/    use cases: create_payment, process_payment (steps), relay, recovery, replay, retry policy, ports
   infrastructure/ PostgreSQL repositories + unit of work, simulated gateway, HTTP webhook sender, URL policy, signing
-  api/            FastAPI app, routes, schemas, middleware (auth, request id, body cap), error envelope
-  messaging/      FastStream topology, publisher (confirms), the single consumer, consumer process
-  bootstrap.py    composition root · cli.py: api | consumer | migrate | replay
-alembic/          async env + migration 0001
+  api/            FastAPI app, routes, schemas, middleware (auth, request id, body cap), error format
+  messaging/      RabbitMQ topology, publisher with confirms, the one consumer, the consumer process
+  bootstrap.py    wiring · cli.py: api | consumer | migrate | replay
+alembic/          async env + migrations 0001, 0002
 tests/            unit (fakes, Hypothesis) · integration (real PostgreSQL) · rabbit (real RabbitMQ) · e2e (compose)
-tools/            demo webhook receiver, demo script
-docs/adr/         four decisions: delivery guarantees, outbox retries, consumer stages, webhook security
+tools/            demo webhook receiver, demo script, repository hygiene check
+docs/adr/         four decisions: delivery guarantees, retries, consumer steps, webhook security
 ```
 
-Dependency rule: `domain` imports nothing from the outer layers; `application` depends only on
-`ports` (Protocols with real and in-memory implementations); HTTP and AMQP translate errors at
-the edge (`409`/`422`/`503`, ACK/NACK/REJECT).
+Rule of thumb: `domain` imports nothing from the outer layers; `application` depends only on
+the interfaces in `ports.py`; HTTP and AMQP translate results at the edge (`409`/`422`/`503`,
+ACK/NACK/REJECT).
 
-## Development
+## Development and quality gates
 
 ```bash
 uv sync --all-groups
-make check             # ruff format/lint, mypy --strict, bandit, pip-audit
-make test-unit         # 180 unit + property tests, no services, ~5 s
+uv run pre-commit install                      # ruff, gitleaks, file checks before every commit
+make check                                     # ruff format/lint, mypy --strict, bandit, pip-audit, radon
+make test-unit                                 # ~200 unit + property tests, no services, a few seconds
 POSTGRES_HOST_PORT=5433 docker compose up -d postgres rabbitmq
 TEST_DATABASE_URL=postgresql+asyncpg://payments:payments@127.0.0.1:5433/payments_test make test-integration
-make cov               # branch coverage (92 % on the last run)
 make up && make test-e2e
 ```
 
-Integration suites skip themselves when the service is unreachable, so `pytest` is always safe
-to run. The `tests/rabbit` suite starts its own consumer on `payments.new`, so it must not share
-a broker with a running compose `consumer` (`docker compose stop consumer` first, or point
-`TEST_RABBITMQ_URL` at a separate vhost). CI (`.github/workflows/ci.yml`) runs static gates,
-unit, PostgreSQL+RabbitMQ and the compose e2e suite on isolated services.
+The integration suites skip themselves when the service is unreachable, so `pytest` is always
+safe to run. `tests/rabbit` starts its own consumer on `payments.new`, so stop the compose
+`consumer` first (or point `TEST_RABBITMQ_URL` at another vhost).
+
+CI on GitHub runs four independent gates on every push and pull request:
+
+| workflow | what it checks |
+|---|---|
+| `code` | formatting, lint, `mypy --strict`, cyclomatic complexity (no function worse than grade B) |
+| `logic` | unit + property tests with ≥ 85 % coverage, real PostgreSQL + RabbitMQ, docker compose end-to-end |
+| `security` | `pip-audit` (also weekly), `bandit`, `gitleaks` over the whole history, CodeQL, hadolint, Trivy for config and the built image |
+| `files` | lockfile in sync, forbidden files, YAML/TOML/JSON validity, line endings, single migration head, `docker compose config`, all pre-commit hooks |
+
+Dependabot opens weekly update PRs for Python packages, GitHub Actions and base images.
 
 ## Operations
 
-* **Health**: `GET /health/live`, `GET /health/ready` (DB round-trip) — both need `X-API-Key`.
-* **Logs**: JSON lines with `request_id`, `payment_id`, `event_id`, `phase`, `attempt`,
-  `outcome`, `error_code`, `duration_ms`.
-* **Signals worth alerting on**: messages in `payments.dlq`, oldest unpublished outbox age,
-  `pending` payments older than the lease, relay/recovery task death (the process exits with 1).
-* **Shutdown**: SIGTERM stops consuming, waits up to 30 s for in-flight handlers, unacked
-  messages are redelivered; expired leases are recovered by the scan.
+* Health: `GET /health/live`, `GET /health/ready` (database round-trip). Both need the API key.
+* Logs: one JSON line per event with `request_id`, `payment_id`, `event_id`, `phase`,
+  `attempt`, `outcome`, `error_code`, `duration_ms`.
+* Worth an alert: anything in `payments.dlq`, old unpublished outbox rows, `pending` payments
+  older than the lease, the consumer process restarting (a background loop gave up).
+* Shutdown: SIGTERM stops consuming, waits up to 30 s for in-flight handlers; unacknowledged
+  messages are redelivered and expired reservations are picked up by the recovery scan.
 
 ## What this is not
 
-A fiat payment *simulation* with the integration seams a real gateway needs (`PaymentGateway`
-port, idempotent stages, unknown-outcome handling). It is not a ledger, not multi-tenant
-(one static key ⇒ global idempotency scope; the next step would be
-`UNIQUE(merchant_id, idempotency_key)` and tenant-scoped reads), and it does not promise
-exactly-once webhooks. Single-node Compose is not HA: volumes are mandatory, replication is not
-provided.
+A simulation of a card payment flow with the seams a real gateway needs. It is not a ledger,
+not multi-tenant (one static key means one global idempotency scope), and it does not promise
+exactly-once webhooks. Single-node compose is not highly available: volumes are mandatory,
+replication is not provided.

@@ -1,1 +1,1 @@
-"""Adapters: PostgreSQL, simulated gateway, HTTP webhooks, system clock."""
+"""Real implementations of the interfaces: PostgreSQL, simulated gateway, HTTP webhooks, clock."""

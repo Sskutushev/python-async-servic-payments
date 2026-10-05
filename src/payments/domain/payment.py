@@ -1,13 +1,12 @@
-"""Payment aggregate: status machine, processing lease and notification lifecycle.
+"""The Payment itself: its status, the processing lease and the webhook lifecycle.
 
-Two independent state machines live on one row on purpose (the task asks for
-``payments`` + ``outbox`` only):
+One row tracks two separate things on purpose (the task allows only two tables):
 
-* ``status``: pending -> succeeded | failed (terminal, never reverts).
-* ``notification_status``: not_ready -> pending -> delivered | exhausted.
+* ``status``: pending -> succeeded or failed. Final, never changes back.
+* ``notification_status``: not_ready -> pending -> delivered or exhausted.
 
-A webhook failure can never change ``status``: that is the core guarantee that
-"a payment is not re-processed because the notification did not get through".
+A failed webhook can never touch ``status``. That is what guarantees a payment is not
+charged again just because the notification did not get through.
 """
 
 from __future__ import annotations
@@ -31,15 +30,15 @@ class PaymentStatus(StrEnum):
 
 
 class NotificationStatus(StrEnum):
-    NOT_READY = "not_ready"  # gateway result not yet known
-    PENDING = "pending"  # result known, webhook not yet accepted by the receiver
+    NOT_READY = "not_ready"  # no gateway result yet, nothing to send
+    PENDING = "pending"  # result known, receiver has not accepted the webhook yet
     DELIVERED = "delivered"
-    EXHAUSTED = "exhausted"  # retry budget spent, sent to DLQ for operators
+    EXHAUSTED = "exhausted"  # all attempts used, handed to operators via the DLQ
 
 
 @dataclass(frozen=True, slots=True)
 class GatewayOutcome:
-    """Business result of the external gateway. Transport problems are exceptions."""
+    """What the gateway answered: paid or declined. "Could not reach it" is an exception instead."""
 
     succeeded: bool
     reference: str
@@ -63,10 +62,13 @@ class Payment:
     gateway_attempts: int = 0
     processing_lease_token: uuid.UUID | None = None
     processing_lease_until: datetime | None = None
+    processing_halted_at: datetime | None = None  # set when an operator must look at it
+    processing_halt_reason: str | None = None
     notification_status: NotificationStatus = NotificationStatus.NOT_READY
     notification_event_id: uuid.UUID | None = None
     notification_body: dict[str, Any] | None = None
     notification_attempts: int = 0
+    notification_lease_token: uuid.UUID | None = None  # which worker owns the current attempt
     notification_next_attempt_at: datetime | None = None
     notification_delivered_at: datetime | None = None
     notification_last_error: str | None = None
@@ -76,14 +78,24 @@ class Payment:
     def is_final(self) -> bool:
         return self.status is not PaymentStatus.PENDING
 
+    @property
+    def is_processing_halted(self) -> bool:
+        """True when the gateway could not be reached too many times; only replay resumes it."""
+        return self.processing_halted_at is not None
+
     # --------------------------------------------------------- processing lease
     def processing_lease_active(self, now: datetime) -> bool:
         return self.processing_lease_until is not None and self.processing_lease_until > now
 
+    def owns_processing(self, token: uuid.UUID) -> bool:
+        return self.processing_lease_token == token
+
     def claim_processing(self, token: uuid.UUID, now: datetime, lease: timedelta) -> bool:
-        """Take the processing lease. Returns False when another worker holds it."""
+        """Reserve the payment for this worker. Returns False if another worker holds it."""
         if self.is_final:
             raise InvalidTransition("payment already has a final result")
+        if self.is_processing_halted:
+            raise InvalidTransition("processing is halted until an operator replays it")
         if self.processing_lease_active(now) and self.processing_lease_token != token:
             return False
         self.processing_lease_token = token
@@ -98,11 +110,32 @@ class Payment:
     def record_gateway_attempt(self) -> None:
         self.gateway_attempts += 1
 
+    def halt_processing(self, *, reason: str, now: datetime) -> None:
+        """Stop trying the gateway. The payment stays pending; nothing touches it until replay."""
+        if self.is_final:
+            raise InvalidTransition("payment already has a final result")
+        self.processing_lease_token = None
+        self.processing_lease_until = None
+        self.processing_halted_at = now
+        self.processing_halt_reason = reason
+
+    def resume_processing(self) -> None:
+        """Used by the replay command: lift the halt and give the gateway three new attempts."""
+        if not self.is_processing_halted:
+            raise InvalidTransition("processing is not halted")
+        self.processing_halted_at = None
+        self.processing_halt_reason = None
+        self.gateway_attempts = 0
+
     # -------------------------------------------------------------- result
     def record_gateway_result(
         self, outcome: GatewayOutcome, *, now: datetime, event_id: uuid.UUID
     ) -> None:
-        """Persist the final result and freeze the webhook event in one step."""
+        """Store the final result and build the webhook body at the same time.
+
+        The body is built once and saved, so every delivery attempt sends exactly the
+        same bytes and the same event id.
+        """
         if self.is_final:
             raise InvalidTransition("gateway result already recorded")
         self.status = PaymentStatus.SUCCEEDED if outcome.succeeded else PaymentStatus.FAILED
@@ -134,15 +167,23 @@ class Payment:
             and self.notification_next_attempt_at <= now
         )
 
-    def begin_notification_attempt(self, *, now: datetime, lease: timedelta) -> int:
-        """Count an attempt *before* the network call so a crash mid-flight is still counted.
+    def owns_notification_attempt(self, token: uuid.UUID) -> bool:
+        return self.notification_lease_token == token
 
-        ``next_attempt_at`` is pushed forward by ``lease`` so a crashed attempt is
-        picked up by the recovery scan rather than retried immediately by a duplicate.
+    def begin_notification_attempt(
+        self, *, token: uuid.UUID, now: datetime, lease: timedelta
+    ) -> int:
+        """Count the attempt before the HTTP call, so a crash during the call still counts.
+
+        ``token`` marks which worker owns this attempt: only that worker may record how
+        it went. ``next_attempt_at`` is moved forward by ``lease``: if we crash mid-call,
+        the recovery scan picks the payment up later instead of a duplicate message
+        retrying it right away.
         """
         if self.notification_status is not NotificationStatus.PENDING:
             raise InvalidTransition("notification is not pending")
         self.notification_attempts += 1
+        self.notification_lease_token = token
         self.notification_next_attempt_at = now + lease
         return self.notification_attempts
 
@@ -151,12 +192,14 @@ class Payment:
             raise InvalidTransition("notification is not pending")
         self.notification_status = NotificationStatus.DELIVERED
         self.notification_delivered_at = now
+        self.notification_lease_token = None
         self.notification_next_attempt_at = None
         self.notification_last_error = None
 
     def schedule_notification_retry(self, *, error: str, next_attempt_at: datetime) -> None:
         if self.notification_status is not NotificationStatus.PENDING:
             raise InvalidTransition("notification is not pending")
+        self.notification_lease_token = None
         self.notification_last_error = error
         self.notification_next_attempt_at = next_attempt_at
 
@@ -164,14 +207,16 @@ class Payment:
         if self.notification_status is not NotificationStatus.PENDING:
             raise InvalidTransition("notification is not pending")
         self.notification_status = NotificationStatus.EXHAUSTED
+        self.notification_lease_token = None
         self.notification_last_error = error
         self.notification_next_attempt_at = None
 
     def reopen_notification(self, now: datetime) -> None:
-        """Operator replay: give an exhausted notification a fresh retry budget."""
+        """Used by the replay command: give an exhausted notification three new attempts."""
         if self.notification_status is not NotificationStatus.EXHAUSTED:
             raise InvalidTransition("only exhausted notifications can be replayed")
         self.notification_status = NotificationStatus.PENDING
         self.notification_attempts = 0
+        self.notification_lease_token = None
         self.notification_next_attempt_at = now
         self.notification_last_error = None

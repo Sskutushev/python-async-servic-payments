@@ -30,7 +30,7 @@ async def test_recovery_requeues_lost_notification_attempt(uow_factory, store, c
     p = make_payment(created_at=clock.now() - timedelta(minutes=10))
     p.record_gateway_result(SUCCESS, now=clock.now() - timedelta(minutes=10), event_id=uuid.uuid4())
     p.begin_notification_attempt(
-        now=clock.now() - timedelta(minutes=10), lease=timedelta(seconds=15)
+        token=uuid.uuid4(), now=clock.now() - timedelta(minutes=10), lease=timedelta(seconds=15)
     )
     store.payments[p.id] = p
     assert await recover_stalled_payments(uow_factory, clock, grace=GRACE) == 1
@@ -48,7 +48,7 @@ async def test_recovery_ignores_fresh_work_and_scheduled_retries(uow_factory, st
     )  # unpublished event exists
     done = make_payment(created_at=clock.now() - timedelta(minutes=10))
     done.record_gateway_result(SUCCESS, now=clock.now(), event_id=uuid.uuid4())
-    done.begin_notification_attempt(now=clock.now(), lease=timedelta(1))
+    done.begin_notification_attempt(token=uuid.uuid4(), now=clock.now(), lease=timedelta(1))
     done.mark_notification_delivered(clock.now())
     store.payments[done.id] = done
     assert await recover_stalled_payments(uow_factory, clock, grace=GRACE) == 0
@@ -64,7 +64,7 @@ async def test_recovery_is_idempotent_across_runs(uow_factory, store, clock) -> 
 async def test_replay_reopens_exhausted_notification(uow_factory, store, clock) -> None:
     p = make_payment()
     p.record_gateway_result(SUCCESS, now=clock.now(), event_id=uuid.uuid4())
-    p.begin_notification_attempt(now=clock.now(), lease=timedelta(1))
+    p.begin_notification_attempt(token=uuid.uuid4(), now=clock.now(), lease=timedelta(1))
     p.exhaust_notification(error="http_500")
     store.payments[p.id] = p
     assert await replay_payment(uow_factory, clock, p.id) is ReplayAction.NOTIFICATION_REOPENED
@@ -77,20 +77,39 @@ async def test_replay_reopens_exhausted_notification(uow_factory, store, clock) 
     assert event.payload["phase"] == Phase.NOTIFY
 
 
-async def test_replay_requeues_pending_payment_after_gateway_outage(
-    uow_factory, store, clock
-) -> None:
+async def test_replay_resumes_halted_processing(uow_factory, store, clock) -> None:
     p = make_payment()
     p.gateway_attempts = 3
+    p.halt_processing(reason="gateway_unavailable_after_budget", now=clock.now())
     store.payments[p.id] = p
-    assert await replay_payment(uow_factory, clock, p.id) is ReplayAction.PROCESSING_REQUEUED
-    assert store.payments[p.id].gateway_attempts == 0
+    assert await replay_payment(uow_factory, clock, p.id) is ReplayAction.PROCESSING_RESUMED
+    saved = store.payments[p.id]
+    assert saved.gateway_attempts == 0
+    assert not saved.is_processing_halted
+    [event] = store.unpublished()
+    assert event.payload["phase"] == Phase.PROCESS
+
+
+async def test_replay_refuses_pending_payment_that_is_not_halted(uow_factory, store, clock) -> None:
+    """Only an explicit halt opens a new budget; a merely slow payment is not replayable."""
+    p = make_payment()
+    p.gateway_attempts = 2
+    store.payments[p.id] = p
+    with pytest.raises(InvalidTransition):
+        await replay_payment(uow_factory, clock, p.id)
+
+
+async def test_recovery_ignores_halted_payments(uow_factory, store, clock) -> None:
+    p = make_payment(created_at=clock.now() - timedelta(minutes=10))
+    p.halt_processing(reason="gateway_unavailable_after_budget", now=clock.now())
+    store.payments[p.id] = p
+    assert await recover_stalled_payments(uow_factory, clock, grace=GRACE) == 0
 
 
 async def test_replay_refuses_healthy_or_unknown_payments(uow_factory, store, clock) -> None:
     p = make_payment()
     p.record_gateway_result(SUCCESS, now=clock.now(), event_id=uuid.uuid4())
-    p.begin_notification_attempt(now=clock.now(), lease=timedelta(1))
+    p.begin_notification_attempt(token=uuid.uuid4(), now=clock.now(), lease=timedelta(1))
     p.mark_notification_delivered(clock.now())
     store.payments[p.id] = p
     with pytest.raises(InvalidTransition):

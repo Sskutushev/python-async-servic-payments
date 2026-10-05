@@ -1,5 +1,8 @@
-"""Wire format of messages in ``payments.new``. Only ``payment_id`` drives behaviour:
-the consumer reads current state from the database, never from the message."""
+"""What a message in ``payments.new`` looks like.
+
+The consumer only really uses ``payment_id``. Everything about the payment's current
+state is read from the database, never trusted from the message.
+"""
 
 from __future__ import annotations
 

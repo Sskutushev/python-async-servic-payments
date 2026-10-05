@@ -1,5 +1,8 @@
-"""SQLAlchemy table definitions. Constraints encode the domain invariants a second time
-so that no code path (including manual SQL) can store an impossible state."""
+"""The two database tables.
+
+The CHECK constraints repeat the business rules on the database side, so that nothing,
+not even hand-written SQL, can store a payment in an impossible state.
+"""
 
 from __future__ import annotations
 
@@ -63,10 +66,13 @@ class PaymentRow(Base):
     gateway_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     processing_lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     processing_lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_halted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_halt_reason: Mapped[str | None] = mapped_column(String(64))
     notification_status: Mapped[str] = mapped_column(String(16), nullable=False)
     notification_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), unique=True)
     notification_body: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     notification_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    notification_lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     notification_next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     notification_delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     notification_last_error: Mapped[str | None] = mapped_column(String(128))
@@ -87,8 +93,15 @@ class PaymentRow(Base):
             name="notification_follows_result",
         ),
         CheckConstraint("gateway_attempts >= 0", name="gateway_attempts_non_negative"),
+        CheckConstraint(
+            "(processing_halted_at IS NULL) = (processing_halt_reason IS NULL)",
+            name="halt_reason_with_timestamp",
+        ),
+        CheckConstraint(
+            "status = 'pending' OR processing_halted_at IS NULL", name="halt_only_while_pending"
+        ),
         CheckConstraint("notification_attempts >= 0", name="notification_attempts_non_negative"),
-        # Recovery scan: pending payments and pending notifications are looked up by time.
+        # Used by the recovery scan, which looks for overdue pending work by time.
         Index(
             "ix_payments_pending_work",
             "notification_next_attempt_at",
@@ -121,7 +134,7 @@ class OutboxRow(Base):
     last_error: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
-        # The relay only ever scans unpublished rows ordered by availability.
+        # The relay only ever asks for unpublished rows, oldest due first.
         Index(
             "ix_outbox_unpublished",
             "available_at",

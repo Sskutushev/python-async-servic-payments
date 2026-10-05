@@ -1,5 +1,8 @@
-"""In-memory implementations of the ports. They mimic transaction semantics
-(changes are staged until ``commit``) so use cases can be exercised without a database."""
+"""In-memory versions of the interfaces, for fast tests without a database or broker.
+
+They behave like transactions: changes are kept aside until ``commit()`` and dropped
+otherwise, so crash scenarios can be simulated precisely.
+"""
 
 from __future__ import annotations
 
@@ -65,7 +68,7 @@ class InMemoryStore:
     payments: dict[uuid.UUID, Payment] = field(default_factory=dict)
     outbox: dict[uuid.UUID, OutboxEvent] = field(default_factory=dict)
     commits: int = 0
-    # Fault injection: called right before a commit is applied; raise to simulate a crash.
+    # Crash simulation: called right before a commit is applied; raise to "kill" the process.
     before_commit: Callable[[int], None] | None = None
 
     def unpublished(self) -> list[OutboxEvent]:
@@ -117,7 +120,10 @@ class InMemoryPaymentRepository:
                 p.processing_lease_until is None or p.processing_lease_until < older_than
             )
             if (
-                p.status is PaymentStatus.PENDING and p.created_at < older_than and lease_overdue
+                p.status is PaymentStatus.PENDING
+                and not p.is_processing_halted
+                and p.created_at < older_than
+                and lease_overdue
             ) or (
                 p.notification_status is NotificationStatus.PENDING
                 and p.notification_next_attempt_at is not None
@@ -214,7 +220,7 @@ class InMemoryUnitOfWork:
 
 
 class FakeGateway:
-    """Scripted outcomes; records every charge so tests can prove "charged once"."""
+    """Returns the answers it was given, in order, and remembers every charge it was asked for."""
 
     def __init__(self, *outcomes: GatewayOutcome | GatewayTransportError) -> None:
         self._script = list(outcomes)

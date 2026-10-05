@@ -80,11 +80,11 @@ def test_final_payment_cannot_be_claimed() -> None:
 def test_notification_lifecycle_never_touches_status() -> None:
     p = make_payment()
     p.record_gateway_result(SUCCESS, now=T0, event_id=uuid.uuid4())
-    assert p.begin_notification_attempt(now=T0, lease=LEASE) == 1
+    assert p.begin_notification_attempt(token=uuid.uuid4(), now=T0, lease=LEASE) == 1
     assert not p.notification_due(T0)  # pushed forward while in flight
     p.schedule_notification_retry(error="http_500", next_attempt_at=T0 + timedelta(seconds=1))
     assert p.notification_due(T0 + timedelta(seconds=1))
-    assert p.begin_notification_attempt(now=T0, lease=LEASE) == 2
+    assert p.begin_notification_attempt(token=uuid.uuid4(), now=T0, lease=LEASE) == 2
     p.exhaust_notification(error="http_500")
     assert p.notification_status is NotificationStatus.EXHAUSTED
     assert p.status is PaymentStatus.SUCCEEDED
@@ -92,7 +92,7 @@ def test_notification_lifecycle_never_touches_status() -> None:
     p.reopen_notification(T0)
     assert p.notification_status is NotificationStatus.PENDING
     assert p.notification_attempts == 0
-    p.begin_notification_attempt(now=T0, lease=LEASE)
+    p.begin_notification_attempt(token=uuid.uuid4(), now=T0, lease=LEASE)
     p.mark_notification_delivered(T0)
     assert p.notification_status is NotificationStatus.DELIVERED
     assert p.notification_delivered_at == T0
@@ -101,7 +101,7 @@ def test_notification_lifecycle_never_touches_status() -> None:
 def test_notification_transitions_require_pending() -> None:
     p = make_payment()
     with pytest.raises(InvalidTransition):
-        p.begin_notification_attempt(now=T0, lease=LEASE)
+        p.begin_notification_attempt(token=uuid.uuid4(), now=T0, lease=LEASE)
     with pytest.raises(InvalidTransition):
         p.mark_notification_delivered(T0)
     with pytest.raises(InvalidTransition):
@@ -115,7 +115,7 @@ def test_terminal_status_is_sticky_under_any_notification_sequence(ops: list[str
     for op in ops:
         try:
             if op == "retry":
-                p.begin_notification_attempt(now=T0, lease=LEASE)
+                p.begin_notification_attempt(token=uuid.uuid4(), now=T0, lease=LEASE)
                 p.schedule_notification_retry(error="x", next_attempt_at=T0)
             elif op == "delivered":
                 p.mark_notification_delivered(T0)

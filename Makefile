@@ -21,7 +21,13 @@ security: ## bandit + pip-audit
 	uv run bandit -q -c pyproject.toml -r src
 	uv run pip-audit --strict
 
-check: lint type security ## all static gates
+complexity: ## no function may be harder to read than grade B
+	uv run radon cc src --min C --total-average
+
+hygiene: ## forbidden files, parseable configs, line endings
+	uv run python tools/check_repo.py
+
+check: lint type security complexity hygiene ## all static gates
 
 test-unit: ## unit + property tests (no external services)
 	uv run pytest tests/unit -q

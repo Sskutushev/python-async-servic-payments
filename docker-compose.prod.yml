@@ -1,0 +1,43 @@
+# Production-style overlay. Use together with the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Differences from the demo setup:
+#   * APP_ENV=prod: the service refuses demo secrets and the dev-only webhook flags;
+#   * every secret must come from the environment, there are no defaults;
+#   * no ports are published for PostgreSQL / RabbitMQ (management UI included);
+#   * the demo webhook receiver is not part of this profile.
+#
+# The images, the database schema and the code are exactly the same as in the demo.
+
+x-prod-env: &prod-env
+  APP_ENV: prod
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  API_KEY: ${API_KEY:?set API_KEY (at least 16 characters, not a demo value)}
+  WEBHOOK_SECRET: ${WEBHOOK_SECRET:?set WEBHOOK_SECRET (at least 16 characters, not a demo value)}
+  DATABASE_URL: postgresql+asyncpg://payments:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/payments
+  RABBITMQ_URL: amqp://payments:${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD}@rabbitmq:5672/
+  WEBHOOK_ALLOWED_HOSTS: ${WEBHOOK_ALLOWED_HOSTS:-}
+  WEBHOOK_ALLOW_PRIVATE_NETWORKS: "false"
+  WEBHOOK_ALLOW_INSECURE_HTTP: "false"
+  GATEWAY_SEED: ${GATEWAY_SEED:?set GATEWAY_SEED}
+
+services:
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    ports: !reset []
+
+  rabbitmq:
+    environment:
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD}
+    ports: !reset []
+
+  migrate:
+    environment: *prod-env
+
+  api:
+    environment: *prod-env
+
+  consumer:
+    environment: *prod-env

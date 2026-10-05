@@ -1,12 +1,15 @@
-"""The one subscriber. Maps ``ProcessOutcome`` to explicit broker acknowledgements:
+"""The one and only consumer of ``payments.new``.
 
-* every business outcome (including retry/DLQ, which are durable outbox rows) -> ACK;
-* unknown payment / malformed envelope -> REJECT (broker dead-letters it to ``payments.dlq``);
-* infrastructure failure (DB down, ...) -> NACK with requeue after a short pause,
-  so the attempt budget is not consumed by our own outage.
+It runs ``ProcessPayment`` and then tells RabbitMQ what to do with the message:
 
-Acknowledgement is manual on purpose: nothing is acked before the state change
-that makes the message redundant has been committed.
+* the work is done, or a retry / dead letter is saved in the outbox -> ACK;
+* the message is broken or names a payment we do not have -> REJECT (RabbitMQ moves
+  it to ``payments.dlq``);
+* our own infrastructure failed (database down, ...) -> NACK and requeue after a short
+  pause. Our outage must not use up the payment's attempts.
+
+Acknowledgements are sent by hand on purpose: a message is only acknowledged after the
+database change that makes it unnecessary has been committed.
 """
 
 from __future__ import annotations

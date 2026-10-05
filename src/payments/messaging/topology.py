@@ -1,11 +1,11 @@
-"""Broker topology.
+"""Queues and exchanges in RabbitMQ.
 
     payments.events (direct, durable) --payments.new--> payments.new (durable, DLX -> payments.dead)
     payments.dead   (direct, durable) --payments.failed--> payments.dlq (durable)
 
-Two paths lead to the DLQ: the consumer *rejects* malformed/unknown messages
-(broker dead-lettering), and exhausted retries are published there explicitly
-through the outbox (durable, confirmed, carries a diagnostic envelope).
+Messages reach the dead-letter queue in two ways: the consumer rejects a broken or
+unknown message (RabbitMQ moves it), or the service publishes a dead-letter event
+through the outbox after the last failed attempt (with a readable explanation inside).
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ EXCHANGES = {PAYMENTS_EXCHANGE: payments_exchange, DEAD_LETTER_EXCHANGE: dead_le
 
 
 async def declare_topology(broker: RabbitBroker) -> None:
-    """Idempotent: declaring existing durable objects with identical args is a no-op."""
+    """Safe to call on every start: declaring something that already exists changes nothing."""
     await broker.declare_exchange(payments_exchange)
     await broker.declare_exchange(dead_letter_exchange)
     new_q = await broker.declare_queue(payments_new_queue)

@@ -1,0 +1,87 @@
+# Gate 3 — Security: known-vulnerable dependencies, risky code patterns, leaked secrets,
+# container and config issues.
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1" # weekly: new CVEs appear without code changes
+
+permissions:
+  contents: read
+  security-events: write # lets CodeQL / Trivy upload results to the Security tab
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  dependencies:
+    name: dependency vulnerabilities (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      - run: uv run pip-audit --strict --desc
+
+  code-patterns:
+    name: risky code patterns (bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      - run: uv run bandit -c pyproject.toml -r src -f txt
+
+  secrets:
+    name: leaked secrets (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # scan the whole history, not only the last commit
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  codeql:
+    name: static analysis (CodeQL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-and-quality
+      - uses: github/codeql-action/analyze@v3
+
+  container:
+    name: image + config scan (trivy, hadolint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Dockerfile best practices
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+      - name: Misconfigurations in Dockerfile / compose / workflows
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+      - run: docker build -t payments:ci .
+      - name: Vulnerabilities in the built image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: payments:ci
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL

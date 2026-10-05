@@ -1,0 +1,63 @@
+# Gate 1 — Code: is the code formatted, lint-clean and fully typed?
+name: code
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  format:
+    name: formatting (ruff format)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      - run: uv run ruff format --check src tests alembic tools
+
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      - run: uv run ruff check src tests alembic tools --output-format github
+
+  types:
+    name: types (mypy --strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      - run: uv run mypy
+
+  complexity:
+    name: complexity (radon)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      # Fail if any function is harder to read than grade B (cyclomatic complexity > 10).
+      - run: uv run radon cc src --min C --total-average
+      - run: |
+          if [ -n "$(uv run radon cc src --min C | grep -v '^$')" ]; then
+            echo "::error::functions with complexity C or worse found (see above)"; exit 1
+          fi

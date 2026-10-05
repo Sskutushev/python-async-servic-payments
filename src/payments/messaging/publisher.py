@@ -1,7 +1,8 @@
-"""RabbitMQ implementation of :class:`EventPublisher`.
+"""Publishes outbox events to RabbitMQ.
 
-``mandatory=True`` + publisher confirms: an unroutable message is *returned* by
-the broker and surfaces as an exception, so it is never marked published.
+We wait for the broker to confirm every message, and ``mandatory=True`` makes the broker
+return a message that no queue would receive. Both cases become ``PublishError``, so an
+event is never marked as published unless a queue really got it.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ class RabbitEventPublisher:
                 headers={"schema_version": event.schema_version},
                 timeout=self._timeout,
             )
-        except DeliveryError as exc:  # basic.return (unroutable) or basic.nack
+        except DeliveryError as exc:  # no queue for the message, or the broker refused it
             raise PublishError("unroutable_or_nacked") from exc
         except (AMQPError, TimeoutError, ConnectionError, OSError) as exc:
             raise PublishError("broker_unavailable") from exc

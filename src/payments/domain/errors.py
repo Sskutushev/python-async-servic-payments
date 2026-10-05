@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 class DomainError(Exception):
-    """Base class for rule violations. Carries a stable machine-readable ``code``."""
+    """A business rule was broken. ``code`` is a short, stable name for the API/logs."""
 
     code = "domain_error"
 
@@ -19,7 +19,7 @@ class InvalidTransition(DomainError):
 
 
 class IdempotencyConflict(DomainError):
-    """Same ``Idempotency-Key`` reused with a different request body."""
+    """The same Idempotency-Key was sent again, but with a different request body."""
 
     code = "idempotency_conflict"
 

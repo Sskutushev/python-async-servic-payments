@@ -1,8 +1,8 @@
-"""Typed runtime configuration.
+"""All configuration, read from environment variables.
 
-Every value is validated once at process start. Secrets are ``SecretStr`` so they
-never leak through ``repr``/logging. Production-unsafe switches are rejected when
-``APP_ENV=prod``.
+Values are checked once when the process starts, so a bad setting fails fast instead
+of surfacing later. Secrets are wrapped in ``SecretStr`` so they never show up in logs
+or error messages. Dev-only switches are refused when ``APP_ENV=prod``.
 """
 
 from __future__ import annotations
@@ -75,9 +75,13 @@ class Settings(BaseSettings):
     # --- outbox relay / consumer -----------------------------------------------
     outbox_poll_interval_seconds: float = Field(default=0.5, gt=0)
     outbox_batch_size: int = Field(default=100, ge=1, le=1000)
+    outbox_publish_concurrency: int = Field(default=10, ge=1, le=100)
     outbox_lease_seconds: float = Field(default=30.0, gt=0)
     recovery_interval_seconds: float = Field(default=30.0, gt=0)
     recovery_grace_seconds: float = Field(default=120.0, gt=0)
+    background_max_consecutive_failures: int = Field(
+        default=10, ge=1, description="A background loop that fails this often in a row exits"
+    )
     consumer_prefetch: int = Field(default=8, ge=1, le=1000)
 
     @field_validator("webhook_allowed_hosts", mode="before")
@@ -101,6 +105,17 @@ class Settings(BaseSettings):
             if unsafe:
                 msg = f"{', '.join(unsafe)} must be disabled when APP_ENV=prod"
                 raise ValueError(msg)
+            demo = [
+                name
+                for name in ("api_key", "webhook_secret", "gateway_seed")
+                if _looks_like_demo_secret(getattr(self, name).get_secret_value())
+            ]
+            if demo:
+                msg = f"{', '.join(demo)} still has a demo value; set a real secret in prod"
+                raise ValueError(msg)
+        if self.processing_lease_seconds < self.gateway_max_delay_seconds * 2:
+            msg = "processing_lease_seconds must be at least twice gateway_max_delay_seconds"
+            raise ValueError(msg)
         return self
 
     @property
@@ -122,6 +137,14 @@ class Settings(BaseSettings):
     @property
     def recovery_grace(self) -> timedelta:
         return timedelta(seconds=self.recovery_grace_seconds)
+
+
+DEMO_SECRET_MARKERS = ("demo", "change-me", "changeme", "example", "simulated-gateway-seed")
+
+
+def _looks_like_demo_secret(value: str) -> bool:
+    lowered = value.lower()
+    return any(marker in lowered for marker in DEMO_SECRET_MARKERS)
 
 
 def load_settings() -> Settings:

@@ -1,8 +1,8 @@
-"""Request fingerprint used to detect ``Idempotency-Key`` reuse with a different body.
+"""A hash of the request body, used to tell "same request again" from "same key, new body".
 
-The hash covers the *validated, normalized* business payload, not raw bytes:
-JSON key order, whitespace and ``100`` vs ``100.00`` must not produce a different
-fingerprint, while any semantic change must.
+The hash is taken over the cleaned-up values, not the raw JSON. So key order, spaces and
+``100`` vs ``100.00`` give the same fingerprint, while changing any real value gives a
+different one.
 """
 
 from __future__ import annotations

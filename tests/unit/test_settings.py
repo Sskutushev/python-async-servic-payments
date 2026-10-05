@@ -12,7 +12,33 @@ def test_prod_rejects_dev_only_switches() -> None:
         app_env=Environment.PROD,
         webhook_allow_private_networks=False,
         webhook_allow_insecure_http=False,
+        gateway_seed="c2e4a6b8d0f1e3a5c7b9d1f3e5a7c9b1",
     )
+
+
+def test_prod_rejects_demo_secrets() -> None:
+    with pytest.raises(ValidationError, match="demo value"):
+        make_settings(
+            app_env=Environment.PROD,
+            webhook_allow_private_networks=False,
+            webhook_allow_insecure_http=False,
+            api_key="demo-api-key-change-me-please",
+            webhook_secret="x" * 32,
+            gateway_seed="y" * 32,
+        )
+    make_settings(
+        app_env=Environment.PROD,
+        webhook_allow_private_networks=False,
+        webhook_allow_insecure_http=False,
+        api_key="9f1c4b7e2a6d8c0b5e3f7a1d9c2b4e6f",
+        webhook_secret="3a7d9c1e5b2f8a4c6e0d1b3f5a7c9e2b",
+        gateway_seed="c2e4a6b8d0f1e3a5c7b9d1f3e5a7c9b1",
+    )
+
+
+def test_processing_lease_must_cover_the_gateway_delay() -> None:
+    with pytest.raises(ValidationError, match="processing_lease_seconds"):
+        make_settings(gateway_max_delay_seconds=40, processing_lease_seconds=60)
 
 
 def test_short_secrets_are_rejected() -> None:

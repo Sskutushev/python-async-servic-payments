@@ -1,13 +1,13 @@
-"""Recovery scan: re-enqueue work whose in-flight message was lost.
+"""Finds payments that got stuck and puts them back into the queue.
 
-Covers two crash windows that neither the outbox nor the broker can see:
+Two situations that neither the outbox nor RabbitMQ can notice on their own:
 
-* a worker died holding the processing lease (pending payment, lease expired);
-* a worker died between counting a webhook attempt and recording its outcome.
+* a worker died while it had the payment reserved (still pending, reservation expired);
+* a worker died after counting a webhook attempt but before saving how it went.
 
-Only payments with *no unpublished outbox event* are touched, so the scan never
-duplicates a retry that is already scheduled. It publishes through the outbox,
-so it is not a second consumer.
+Only payments with no pending outbox event are touched, so a retry that is already
+scheduled is never duplicated. The scan writes to the outbox like everything else; it
+is not a second consumer.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ async def recover_stalled_payments(
                 phase, reason = Phase.PROCESS, "processing_lease_expired"
             elif payment.notification_status is NotificationStatus.PENDING:
                 phase, reason = Phase.NOTIFY, "notification_attempt_lost"
-            else:  # pragma: no cover - query guarantees one of the two
+            else:  # pragma: no cover - the query only returns these two cases
                 continue
             await uow.outbox.add(
                 payment_recovery_event(payment, phase=phase, now=now, reason=reason)

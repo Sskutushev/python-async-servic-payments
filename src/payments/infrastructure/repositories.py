@@ -1,4 +1,8 @@
-"""PostgreSQL implementations of the persistence ports + the SQLAlchemy unit of work."""
+"""Reading and writing payments and outbox events in PostgreSQL.
+
+``SqlUnitOfWork`` is one database transaction: open it, use ``payments`` and ``outbox``,
+call ``commit()``. If ``commit()`` is not called, everything is rolled back.
+"""
 
 from __future__ import annotations
 
@@ -36,10 +40,13 @@ def _payment_from_row(row: PaymentRow) -> Payment:
         gateway_attempts=row.gateway_attempts,
         processing_lease_token=row.processing_lease_token,
         processing_lease_until=row.processing_lease_until,
+        processing_halted_at=row.processing_halted_at,
+        processing_halt_reason=row.processing_halt_reason,
         notification_status=NotificationStatus(row.notification_status),
         notification_event_id=row.notification_event_id,
         notification_body=row.notification_body,
         notification_attempts=row.notification_attempts,
+        notification_lease_token=row.notification_lease_token,
         notification_next_attempt_at=row.notification_next_attempt_at,
         notification_delivered_at=row.notification_delivered_at,
         notification_last_error=row.notification_last_error,
@@ -52,7 +59,7 @@ def _payment_values(payment: Payment) -> dict[str, object]:
         "amount": payment.money.amount,
         "currency": payment.money.currency.value,
         "description": payment.description,
-        "metadata_": payment.metadata,  # ORM attribute key; the column itself is "metadata"
+        "metadata_": payment.metadata,  # the column is called "metadata"; the attribute cannot be
         "idempotency_key": payment.idempotency_key,
         "request_fingerprint": payment.request_fingerprint,
         "webhook_url": payment.webhook_url,
@@ -64,10 +71,13 @@ def _payment_values(payment: Payment) -> dict[str, object]:
         "gateway_attempts": payment.gateway_attempts,
         "processing_lease_token": payment.processing_lease_token,
         "processing_lease_until": payment.processing_lease_until,
+        "processing_halted_at": payment.processing_halted_at,
+        "processing_halt_reason": payment.processing_halt_reason,
         "notification_status": payment.notification_status.value,
         "notification_event_id": payment.notification_event_id,
         "notification_body": payment.notification_body,
         "notification_attempts": payment.notification_attempts,
+        "notification_lease_token": payment.notification_lease_token,
         "notification_next_attempt_at": payment.notification_next_attempt_at,
         "notification_delivered_at": payment.notification_delivered_at,
         "notification_last_error": payment.notification_last_error,
@@ -148,6 +158,7 @@ class SqlPaymentRepository:
                 or_(
                     and_(
                         PaymentRow.status == PaymentStatus.PENDING.value,
+                        PaymentRow.processing_halted_at.is_(None),  # waiting for an operator
                         PaymentRow.created_at < older_than,
                         lease_overdue,
                     ),
@@ -246,7 +257,7 @@ class SqlOutboxRepository:
 
 
 class SqlUnitOfWork:
-    """One session, one transaction. Rolls back unless ``commit`` was called."""
+    """One session, one transaction. Rolls back on exit unless ``commit`` was called."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -268,7 +279,9 @@ class SqlUnitOfWork:
     ) -> None:
         assert self._session is not None
         try:
-            await self._session.rollback()  # no-op after commit; discards partial work otherwise
+            await (
+                self._session.rollback()
+            )  # does nothing after a commit; otherwise discards changes
         finally:
             await self._session.close()
             self._session = None

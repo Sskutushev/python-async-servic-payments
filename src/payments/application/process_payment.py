@@ -1,16 +1,20 @@
-"""The single consumer use case, split into explicit checkpointed stages.
+"""What the consumer does with one message. This is the heart of the service.
 
-Each stage commits its own short transaction *before* any slow I/O (gateway,
-webhook) and re-reads the locked row *after* it. Any message, duplicate or
-redelivered, therefore converges on the persisted state:
+The work is split into small steps. Each step saves its progress in a short database
+transaction before doing anything slow (calling the gateway or the webhook), and reads
+the row again afterwards. So whatever message arrives, even a duplicate, it simply
+continues from the saved state:
 
-    load ─► [pending?] claim lease ─► gateway ─► persist result + frozen webhook
-         ─► [notification due?] count attempt ─► webhook ─► delivered | retry | DLQ
+    load ─► still pending? reserve it ─► gateway ─► save result + webhook body
+         ─► webhook due? count the attempt ─► send webhook ─► delivered | retry | DLQ
 
-* A payment with a stored result never hits the gateway again.
-* A webhook failure never changes ``status``; it only schedules another attempt.
-* Retries and dead letters are outbox rows written atomically with the state
-  change, so the message can be ACKed as soon as the transaction commits.
+* A payment that already has a result is never sent to the gateway again.
+* A failed webhook never changes the payment status; it only schedules another try.
+* Retries and dead letters are rows in the outbox, written in the same transaction as
+  the state change. That is why the message can be acknowledged right after the commit.
+* Every slow call is owned by a lease token. A worker whose lease was taken over by
+  another worker cannot write anything afterwards.
+* The attempt budget is checked before every network call, never only after it.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from payments.application.ports import (
     Clock,
     GatewayTransportError,
     PaymentGateway,
+    UnitOfWork,
     UnitOfWorkFactory,
     WebhookDeliveryError,
     WebhookSender,
@@ -35,18 +40,22 @@ from payments.domain.payment import GatewayOutcome, NotificationStatus, Payment
 
 log = logging.getLogger(__name__)
 
+# Reason codes that end up in the dead-letter message and in ``GET /payments/{id}``.
+GATEWAY_UNAVAILABLE = "gateway_unavailable_after_budget"
+DELIVERY_OUTCOME_UNKNOWN = "delivery_outcome_unknown_after_budget"
+
 
 class ProcessOutcome(StrEnum):
-    """What the consumer should tell the broker. ``POISON`` is the only reject."""
+    """How the message ended. Everything except ``POISON`` means "acknowledge it"."""
 
-    COMPLETED = "completed"  # result stored and webhook delivered
-    RESULT_STORED = "result_stored"  # result stored; webhook not due / already handled
-    RETRY_SCHEDULED = "retry_scheduled"  # transient failure, durable retry enqueued
-    DEAD_LETTERED = "dead_lettered"  # retry budget spent, DLQ event enqueued
-    SKIPPED_LEASED = "skipped_leased"  # another worker is processing right now
-    SKIPPED_STALE = "skipped_stale"  # our lease expired; another worker took over
-    NOOP = "noop"  # nothing left to do (duplicate of finished work)
-    POISON = "poison"  # unknown payment id: reject to the broker DLQ
+    COMPLETED = "completed"  # result saved and webhook delivered
+    RESULT_STORED = "result_stored"  # result saved; webhook is not due yet
+    RETRY_SCHEDULED = "retry_scheduled"  # temporary failure, a retry is scheduled
+    DEAD_LETTERED = "dead_lettered"  # all attempts used, sent to the dead-letter queue
+    SKIPPED_LEASED = "skipped_leased"  # another worker is handling this payment right now
+    SKIPPED_STALE = "skipped_stale"  # we were too slow; another worker took over
+    NOOP = "noop"  # nothing to do: finished, halted, or waiting for an operator
+    POISON = "poison"  # unknown payment id: reject so the broker dead-letters it
 
 
 class ProcessPayment:
@@ -78,10 +87,10 @@ class ProcessPayment:
         return await self._notify_stage(payment_id, event_id)
 
     # ------------------------------------------------------------- stage 1
-    async def _process_stage(
+    async def _process_stage(  # noqa: PLR0911 - every return is one documented checkpoint
         self, payment_id: uuid.UUID, event_id: uuid.UUID | None
     ) -> ProcessOutcome | None:
-        """Obtain and persist the gateway result. ``None`` means "continue to notify"."""
+        """Get the gateway result and save it. Returns ``None`` when the webhook step should run."""
         token = uuid.uuid4()
         async with self._uow_factory() as uow:
             payment = await uow.payments.get_for_update(payment_id)
@@ -90,6 +99,13 @@ class ProcessPayment:
                 return ProcessOutcome.POISON
             if payment.is_final:
                 return None
+            if payment.is_processing_halted:
+                # The gateway budget is used up. Only an operator replay may continue.
+                return ProcessOutcome.NOOP
+            if self._retry.is_exhausted(payment.gateway_attempts):
+                # Budget spent but not halted: a worker died right after its last attempt.
+                # Do not call the gateway a fourth time; hand the payment to an operator.
+                return await self._halt_processing(uow, payment, payment.gateway_attempts, event_id)
             if not payment.claim_processing(token, self._clock.now(), self._processing_lease):
                 return ProcessOutcome.SKIPPED_LEASED
             payment.record_gateway_attempt()
@@ -109,9 +125,10 @@ class ProcessPayment:
         async with self._uow_factory() as uow:
             payment = await self._locked(uow.payments.get_for_update(payment_id))
             if payment.is_final:
-                return None  # someone else stored a result while we were waiting
-            if payment.processing_lease_token != token:
-                # Fencing: our lease expired and was taken over; do not overwrite.
+                return None  # another worker saved a result while we were waiting
+            if not payment.owns_processing(token):
+                # Our reservation expired and another worker took the payment. Its result
+                # will be saved by that worker; ours must not overwrite anything.
                 log.warning("stale processing lease", extra={"payment_id": str(payment_id)})
                 return ProcessOutcome.SKIPPED_STALE
             payment.record_gateway_result(result, now=self._clock.now(), event_id=uuid.uuid4())
@@ -131,55 +148,82 @@ class ProcessPayment:
         exc: GatewayTransportError,
         event_id: uuid.UUID | None,
     ) -> ProcessOutcome:
-        """Transport failure: the outcome is unknown, the payment stays ``pending``."""
+        """We could not reach the gateway. The payment stays pending: unknown is not a decline."""
         now = self._clock.now()
         async with self._uow_factory() as uow:
             payment = await self._locked(uow.payments.get_for_update(payment_id))
-            payment.release_processing(token)
+            if payment.is_final or not payment.owns_processing(token):
+                # Another worker owns the payment now; it decides about retries.
+                log.warning("stale processing lease", extra={"payment_id": str(payment_id)})
+                return ProcessOutcome.SKIPPED_STALE
             if self._retry.is_exhausted(attempt):
-                outcome = ProcessOutcome.DEAD_LETTERED
-                await uow.outbox.add(
-                    payment_dead_letter_event(
-                        payment,
-                        phase=Phase.PROCESS,
-                        attempts=attempt,
-                        failure_code=exc.code,
-                        original_event_id=event_id,
-                        now=now,
-                    )
+                return await self._halt_processing(uow, payment, attempt, event_id, exc.code)
+            payment.release_processing(token)
+            delay = self._retry.delay_before(attempt + 1)
+            await uow.outbox.add(
+                payment_retry_event(
+                    payment,
+                    phase=Phase.PROCESS,
+                    attempt=attempt + 1,
+                    available_at=now + delay,
+                    now=now,
                 )
-            else:
-                outcome = ProcessOutcome.RETRY_SCHEDULED
-                delay = self._retry.delay_before(attempt + 1)
-                await uow.outbox.add(
-                    payment_retry_event(
-                        payment,
-                        phase=Phase.PROCESS,
-                        attempt=attempt + 1,
-                        available_at=now + delay,
-                        now=now,
-                    )
-                )
+            )
             await uow.payments.save(payment)
             await uow.commit()
         log.warning(
-            "gateway unavailable",
-            extra={"payment_id": str(payment_id), "attempt": attempt, "outcome": outcome.value},
+            "gateway unavailable, retry scheduled",
+            extra={"payment_id": str(payment_id), "attempt": attempt, "error_code": exc.code},
         )
-        return outcome
+        return ProcessOutcome.RETRY_SCHEDULED
+
+    async def _halt_processing(
+        self,
+        uow: UnitOfWork,
+        payment: Payment,
+        attempts: int,
+        event_id: uuid.UUID | None,
+        error_code: str = GATEWAY_UNAVAILABLE,
+    ) -> ProcessOutcome:
+        """Stop calling the gateway and write the dead-letter event in the same transaction."""
+        now = self._clock.now()
+        payment.halt_processing(reason=GATEWAY_UNAVAILABLE, now=now)
+        await uow.outbox.add(
+            payment_dead_letter_event(
+                payment,
+                phase=Phase.PROCESS,
+                attempts=attempts,
+                failure_code=error_code,
+                original_event_id=event_id,
+                now=now,
+            )
+        )
+        await uow.payments.save(payment)
+        await uow.commit()
+        log.error(
+            "gateway budget exhausted, payment halted",
+            extra={"payment_id": str(payment.id), "attempt": attempts, "error_code": error_code},
+        )
+        return ProcessOutcome.DEAD_LETTERED
 
     # ------------------------------------------------------------- stage 2
     async def _notify_stage(
         self, payment_id: uuid.UUID, event_id: uuid.UUID | None
     ) -> ProcessOutcome:
+        token = uuid.uuid4()
         async with self._uow_factory() as uow:
             payment = await self._locked(uow.payments.get_for_update(payment_id))
             if payment.notification_status is not NotificationStatus.PENDING:
                 return ProcessOutcome.NOOP
             if not payment.notification_due(self._clock.now()):
-                return ProcessOutcome.RESULT_STORED  # a scheduled retry will arrive later
+                return ProcessOutcome.RESULT_STORED  # the scheduled retry message will come later
+            if self._retry.is_exhausted(payment.notification_attempts):
+                # The last attempt was counted but its outcome was never recorded (a worker
+                # died mid-call). We do not know whether the receiver got it, and we are not
+                # allowed a fourth call: hand it to an operator with the same event id.
+                return await self._exhaust(uow, payment, DELIVERY_OUTCOME_UNKNOWN, event_id)
             attempt = payment.begin_notification_attempt(
-                now=self._clock.now(), lease=self._notification_lease
+                token=token, now=self._clock.now(), lease=self._notification_lease
             )
             url, body, webhook_event_id = (
                 payment.webhook_url,
@@ -189,27 +233,36 @@ class ProcessPayment:
             await uow.payments.save(payment)
             await uow.commit()
 
-        assert body is not None  # frozen together with notification_status=PENDING
+        assert body is not None  # both are set at the moment the status becomes PENDING
         assert webhook_event_id is not None
         try:
             await self._webhooks.deliver(url, webhook_event_id, body)
         except WebhookDeliveryError as exc:
-            return await self._notification_failed(payment_id, attempt, exc, event_id)
-        return await self._notification_delivered(payment_id)
+            return await self._notification_failed(payment_id, token, attempt, exc, event_id)
+        return await self._notification_delivered(payment_id, token)
 
-    async def _notification_delivered(self, payment_id: uuid.UUID) -> ProcessOutcome:
+    async def _notification_delivered(
+        self, payment_id: uuid.UUID, token: uuid.UUID
+    ) -> ProcessOutcome:
         async with self._uow_factory() as uow:
             payment = await self._locked(uow.payments.get_for_update(payment_id))
-            if payment.notification_status is NotificationStatus.PENDING:
-                payment.mark_notification_delivered(self._clock.now())
-                await uow.payments.save(payment)
-                await uow.commit()
+            if not payment.owns_notification_attempt(token):
+                # Our attempt took so long that another worker started a new one. The
+                # receiver accepted ours, but the other worker owns the record now; its
+                # outcome wins. If it ended in "exhausted", an operator replay re-sends the
+                # same event id and the receiver de-duplicates it.
+                log.warning("late webhook success ignored", extra={"payment_id": str(payment_id)})
+                return ProcessOutcome.SKIPPED_STALE
+            payment.mark_notification_delivered(self._clock.now())
+            await uow.payments.save(payment)
+            await uow.commit()
         log.info("webhook delivered", extra={"payment_id": str(payment_id)})
         return ProcessOutcome.COMPLETED
 
     async def _notification_failed(
         self,
         payment_id: uuid.UUID,
+        token: uuid.UUID,
         attempt: int,
         exc: WebhookDeliveryError,
         event_id: uuid.UUID | None,
@@ -217,47 +270,54 @@ class ProcessPayment:
         now = self._clock.now()
         async with self._uow_factory() as uow:
             payment = await self._locked(uow.payments.get_for_update(payment_id))
-            if payment.notification_status is not NotificationStatus.PENDING:
-                return ProcessOutcome.NOOP
-            if exc.retryable and not self._retry.is_exhausted(attempt):
-                outcome = ProcessOutcome.RETRY_SCHEDULED
-                next_attempt = attempt + 1
-                next_at = now + self._retry.delay_before(next_attempt, retry_after=exc.retry_after)
-                payment.schedule_notification_retry(error=exc.code, next_attempt_at=next_at)
-                await uow.outbox.add(
-                    payment_retry_event(
-                        payment,
-                        phase=Phase.NOTIFY,
-                        attempt=next_attempt,
-                        available_at=next_at,
-                        now=now,
-                    )
+            if not payment.owns_notification_attempt(token):
+                log.warning("late webhook failure ignored", extra={"payment_id": str(payment_id)})
+                return ProcessOutcome.SKIPPED_STALE
+            if not exc.retryable or self._retry.is_exhausted(attempt):
+                return await self._exhaust(uow, payment, exc.code, event_id)
+            next_attempt = attempt + 1
+            next_at = now + self._retry.delay_before(next_attempt, retry_after=exc.retry_after)
+            payment.schedule_notification_retry(error=exc.code, next_attempt_at=next_at)
+            await uow.outbox.add(
+                payment_retry_event(
+                    payment, phase=Phase.NOTIFY, attempt=next_attempt, available_at=next_at, now=now
                 )
-            else:
-                outcome = ProcessOutcome.DEAD_LETTERED
-                payment.exhaust_notification(error=exc.code)
-                await uow.outbox.add(
-                    payment_dead_letter_event(
-                        payment,
-                        phase=Phase.NOTIFY,
-                        attempts=attempt,
-                        failure_code=exc.code,
-                        original_event_id=event_id,
-                        now=now,
-                    )
-                )
+            )
             await uow.payments.save(payment)
             await uow.commit()
         log.warning(
-            "webhook delivery failed",
+            "webhook delivery failed, retry scheduled",
+            extra={"payment_id": str(payment_id), "attempt": attempt, "error_code": exc.code},
+        )
+        return ProcessOutcome.RETRY_SCHEDULED
+
+    async def _exhaust(
+        self, uow: UnitOfWork, payment: Payment, error_code: str, event_id: uuid.UUID | None
+    ) -> ProcessOutcome:
+        """Give up on the webhook and write the dead-letter event in the same transaction."""
+        now = self._clock.now()
+        payment.exhaust_notification(error=error_code)
+        await uow.outbox.add(
+            payment_dead_letter_event(
+                payment,
+                phase=Phase.NOTIFY,
+                attempts=payment.notification_attempts,
+                failure_code=error_code,
+                original_event_id=event_id,
+                now=now,
+            )
+        )
+        await uow.payments.save(payment)
+        await uow.commit()
+        log.error(
+            "webhook attempts exhausted",
             extra={
-                "payment_id": str(payment_id),
-                "attempt": attempt,
-                "error_code": exc.code,
-                "outcome": outcome.value,
+                "payment_id": str(payment.id),
+                "attempt": payment.notification_attempts,
+                "error_code": error_code,
             },
         )
-        return outcome
+        return ProcessOutcome.DEAD_LETTERED
 
     @staticmethod
     async def _locked(coro: Awaitable[Payment | None]) -> Payment:

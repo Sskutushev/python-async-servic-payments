@@ -1,7 +1,7 @@
-"""Structured JSON logging with request/payment correlation fields.
+"""JSON logs, one line per event, with ids to follow a request or a payment across services.
 
-Only whitelisted ``extra`` keys are emitted so a careless log call cannot leak
-request bodies, webhook URLs with query strings, or secrets.
+Only the fields listed in ``CONTEXT_FIELDS`` are written. A careless ``log.info(...)``
+therefore cannot leak a request body, a webhook URL or a secret.
 """
 
 from __future__ import annotations

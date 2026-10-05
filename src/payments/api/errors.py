@@ -1,4 +1,4 @@
-"""One error envelope for every failure: ``{"error": {code, message, request_id, details?}}``."""
+"""Every error looks the same: ``{"error": {"code", "message", "request_id", "details"?}}``."""
 
 from __future__ import annotations
 
