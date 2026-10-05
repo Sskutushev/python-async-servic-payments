@@ -56,11 +56,26 @@ def forbidden(path: Path) -> bool:
     return any(fnmatch(name, p) for p in FORBIDDEN if not p.startswith("!"))
 
 
+class _LenientYaml(yaml.SafeLoader):
+    """SafeLoader that accepts application tags such as compose's ``!reset`` / ``!override``."""
+
+
+def _construct_any(loader: yaml.SafeLoader, _suffix: str, node: yaml.Node) -> object:
+    if isinstance(node, yaml.SequenceNode):
+        return loader.construct_sequence(node)
+    if isinstance(node, yaml.MappingNode):
+        return loader.construct_mapping(node)
+    return loader.construct_scalar(node)  # type: ignore[arg-type]
+
+
+_LenientYaml.add_multi_constructor("!", _construct_any)
+
+
 def check_parses(path: Path) -> str | None:
     try:
         text = path.read_text(encoding="utf-8")
         if path.suffix in {".yml", ".yaml"}:
-            yaml.safe_load(text)
+            yaml.load(text, Loader=_LenientYaml)  # noqa: S506 - SafeLoader subclass
         elif path.suffix == ".toml":
             tomllib.loads(text)
         elif path.suffix == ".json":

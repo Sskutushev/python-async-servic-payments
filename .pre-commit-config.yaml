@@ -6,6 +6,7 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        args: ["--unsafe"] # syntax only: compose files use the !reset / !override tags
       - id: check-toml
       - id: check-json
       - id: check-added-large-files
