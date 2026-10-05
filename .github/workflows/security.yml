@@ -21,7 +21,7 @@ jobs:
     name: dependency vulnerabilities (pip-audit)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
@@ -32,7 +32,7 @@ jobs:
     name: risky code patterns (bandit)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
@@ -43,7 +43,7 @@ jobs:
     name: leaked secrets (gitleaks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # scan the whole history, not only the last commit
       - uses: gitleaks/gitleaks-action@v2
@@ -54,7 +54,7 @@ jobs:
     name: static analysis (CodeQL)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: github/codeql-action/init@v3
         with:
           languages: python
@@ -65,7 +65,7 @@ jobs:
     name: image + config scan (trivy, hadolint)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Dockerfile best practices
         uses: hadolint/hadolint-action@v3.1.0
         with:
