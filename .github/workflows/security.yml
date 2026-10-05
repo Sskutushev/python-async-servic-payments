@@ -71,7 +71,7 @@ jobs:
         with:
           dockerfile: Dockerfile
       - name: Misconfigurations in Dockerfile / compose / workflows
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: .
@@ -79,7 +79,7 @@ jobs:
           severity: HIGH,CRITICAL
       - run: docker build -t payments:ci .
       - name: Vulnerabilities in the built image
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: payments:ci
           exit-code: "1"
