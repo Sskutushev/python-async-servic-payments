@@ -15,7 +15,7 @@ dependencies = [
     "alembic>=1.14,<2",
     "faststream[rabbit]>=0.7,<0.8",
     "httpx>=0.27,<1",
-    "uvicorn[standard]>=0.32,<1",
+    "uvicorn[standard]>=0.54.0,<1",
 ]
 
 [project.scripts]
