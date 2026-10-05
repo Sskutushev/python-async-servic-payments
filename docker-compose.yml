@@ -1,0 +1,108 @@
+name: payments
+
+x-app-env: &app-env
+  APP_ENV: ${APP_ENV:-dev}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  API_KEY: ${API_KEY:-demo-api-key-change-me-please}
+  WEBHOOK_SECRET: ${WEBHOOK_SECRET:-demo-webhook-secret-change-me}
+  DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+  RABBITMQ_URL: amqp://payments:payments@rabbitmq:5672/
+  # The demo webhook receiver lives on the private compose network, hence the dev-only flags.
+  WEBHOOK_ALLOWED_HOSTS: ${WEBHOOK_ALLOWED_HOSTS:-}
+  WEBHOOK_ALLOW_PRIVATE_NETWORKS: ${WEBHOOK_ALLOW_PRIVATE_NETWORKS:-true}
+  WEBHOOK_ALLOW_INSECURE_HTTP: ${WEBHOOK_ALLOW_INSECURE_HTTP:-true}
+  GATEWAY_MIN_DELAY_SECONDS: ${GATEWAY_MIN_DELAY_SECONDS:-2}
+  GATEWAY_MAX_DELAY_SECONDS: ${GATEWAY_MAX_DELAY_SECONDS:-5}
+  GATEWAY_SUCCESS_RATE: ${GATEWAY_SUCCESS_RATE:-0.9}
+  RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-3}
+  RETRY_BASE_DELAY_SECONDS: ${RETRY_BASE_DELAY_SECONDS:-1}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: payments
+      RABBITMQ_DEFAULT_PASS: payments
+    ports:
+      - "127.0.0.1:${RABBITMQ_HOST_PORT:-5672}:5672"
+      - "127.0.0.1:${RABBITMQ_MGMT_HOST_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build: .
+    command: ["migrate"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    command: ["api"]
+    environment: *app-env
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -H \"X-API-Key: $$API_KEY\" http://localhost:8000/health/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  consumer:
+    build: .
+    command: ["consumer"]
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Demo-only webhook receiver: verifies signatures, can be told to fail N times.
+  webhook-receiver:
+    build: .
+    entrypoint: ["python", "-m", "tools.webhook_receiver"]
+    environment:
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-demo-webhook-secret-change-me}
+      PORT: "9000"
+    volumes:
+      - ./tools:/app/tools:ro
+    ports:
+      - "127.0.0.1:9000:9000"
+    profiles: ["demo"]
+
+volumes:
+  postgres-data:
+  rabbitmq-data:

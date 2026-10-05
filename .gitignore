@@ -1,0 +1,30 @@
+# task statement and planning notes are intentionally not part of the repository
+*.pdf
+python-payment-service-blueprint.md
+.claude/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+
+# environment
+.env
+.env.*
+!.env.example
+
+# editors / os
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

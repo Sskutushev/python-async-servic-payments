@@ -1,0 +1,95 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  static:
+    name: lint · types · security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      - run: uv run ruff format --check src tests alembic tools
+      - run: uv run ruff check src tests alembic tools
+      - run: uv run mypy
+      - run: uv run bandit -q -c pyproject.toml -r src
+      - run: uv run pip-audit --strict
+
+  unit:
+    name: unit · property
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      - run: uv run pytest tests/unit -q --cov --cov-report=xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit
+          path: coverage.xml
+
+  integration:
+    name: postgres · rabbitmq
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: payments
+          POSTGRES_PASSWORD: payments
+          POSTGRES_DB: payments
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U payments" --health-interval 5s --health-timeout 3s --health-retries 10
+      rabbitmq:
+        image: rabbitmq:3.13-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: payments
+          RABBITMQ_DEFAULT_PASS: payments
+        ports: ["5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_port_connectivity" --health-interval 10s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://payments:payments@127.0.0.1:5432/payments_test
+      TEST_RABBITMQ_URL: amqp://payments:payments@127.0.0.1:5672/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      - run: uv run pytest tests/integration tests/rabbit -q --cov --cov-report=term-missing --cov-fail-under=0
+
+  e2e:
+    name: docker compose e2e
+    runs-on: ubuntu-latest
+    needs: [static, unit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      - run: docker compose --profile demo up --build -d --wait
+        env:
+          GATEWAY_MIN_DELAY_SECONDS: "0.2"
+          GATEWAY_MAX_DELAY_SECONDS: "0.5"
+      - run: uv run pytest tests/e2e -q -m e2e
+      - if: always()
+        run: docker compose --profile demo logs --no-color api consumer webhook-receiver | tail -n 200
+      - if: always()
+        run: docker compose --profile demo down -v

@@ -1,0 +1,117 @@
+[project]
+name = "payments"
+version = "0.1.0"
+description = "Asynchronous payment processing service: FastAPI + PostgreSQL + RabbitMQ (outbox, idempotency, retries, DLQ)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Sergei Kutushev" }]
+dependencies = [
+    "fastapi>=0.115,<1",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "sqlalchemy[asyncio]>=2.0.36,<2.1",
+    "asyncpg>=0.30,<1",
+    "alembic>=1.14,<2",
+    "faststream[rabbit]>=0.7,<0.8",
+    "httpx>=0.27,<1",
+    "uvicorn[standard]>=0.32,<1",
+]
+
+[project.scripts]
+payments = "payments.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6",
+    "hypothesis>=6.115",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "bandit>=1.8",
+    "pip-audit>=2.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/payments"]
+
+[tool.uv]
+package = true
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "N", "UP", "B", "A", "C4", "DTZ", "T10", "ISC", "PIE",
+    "PT", "RET", "SIM", "TID", "ARG", "PL", "RUF", "S", "ASYNC", "ERA", "BLE",
+]
+ignore = [
+    "PLR2004",  # magic values are fine in tests/validators
+    "PLR0913",  # explicit dependency injection needs many args
+    "S101",     # asserts in tests
+    "S311",     # non-crypto random is used only for simulated gateway delay
+    "ISC001",   # conflicts with formatter
+    "N818",     # domain exceptions are named after the rule they protect (IdempotencyConflict)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "ARG", "PLR0915", "DTZ", "S108", "PT011", "PT018", "E501", "S104", "PLC0415"]
+"tools/**" = ["E501", "T201"]
+"alembic/**" = ["E501"]
+"src/payments/cli.py" = ["PLC0415"]  # lazy imports keep `payments replay` from importing uvicorn
+
+[tool.ruff.lint.isort]
+known-first-party = ["payments"]
+
+# ---------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+packages = ["payments"]
+
+[[tool.mypy.overrides]]
+module = ["asyncpg.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = [
+    "integration: requires a real PostgreSQL (TEST_DATABASE_URL)",
+    "rabbit: requires a real RabbitMQ (TEST_RABBITMQ_URL)",
+    "e2e: requires the full docker compose stack",
+]
+filterwarnings = ["error::RuntimeWarning"]
+
+[tool.coverage.run]
+branch = true
+source = ["payments"]
+# process wiring is exercised by the compose e2e suite, not by unit coverage
+omit = ["src/payments/cli.py", "src/payments/bootstrap.py", "src/payments/messaging/app.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "\\.\\.\\.$", "raise NotImplementedError"]
+
+# ---------------------------------------------------------------- bandit
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
+# B101: asserts guard internal invariants, never user input. B104: the API binds 0.0.0.0 inside
+# the container by design (ports are published on 127.0.0.1 by compose). B311: non-crypto
+# random only shapes the simulated gateway delay.
+skips = ["B101", "B104", "B311"]
