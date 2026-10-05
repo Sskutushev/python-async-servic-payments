@@ -5,14 +5,23 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Only refresh uv.lock within the ranges declared in pyproject.toml; the ranges
+    # themselves are deliberate (e.g. SQLAlchemy < 2.1) and are changed by hand.
+    versioning-strategy: "lockfile-only"
     groups:
       python-minor-and-patch:
         update-types: ["minor", "patch"]
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # A new Python minor is a deliberate migration (deps, mypy target), not a routine bump.
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
