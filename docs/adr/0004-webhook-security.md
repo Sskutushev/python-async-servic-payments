@@ -23,6 +23,12 @@ again right before sending:
   and the connection (DNS rebinding) cannot redirect us;
 * no redirects, no proxy settings from the environment, response bodies read up to a cap,
   explicit timeouts, bounded connection pool;
+* **no keep-alive**: because requests are pinned to an IP, two merchant hostnames on one IP
+  look like the same origin to the connection pool, and a reused TLS connection would carry
+  a certificate check made for the *other* hostname. Every webhook therefore opens its own
+  connection (one TLS handshake each). A test with a real local TLS server proves it;
+* a DNS failure or timeout (`dns_timeout_seconds`, 3 s) is a *temporary* delivery error that
+  uses the normal retry budget; a forbidden address is a permanent one and is never contacted;
 * `APP_ENV=prod` refuses to start with either dev flag or with demo secrets.
 
 **Signature:** `X-Webhook-Signature: v1=HMAC-SHA256(secret, "<timestamp>.<body>")`,

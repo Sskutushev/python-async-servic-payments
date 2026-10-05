@@ -41,7 +41,11 @@ from payments.domain.payment import GatewayOutcome, NotificationStatus, Payment
 log = logging.getLogger(__name__)
 
 # Reason codes that end up in the dead-letter message and in ``GET /payments/{id}``.
+# "unavailable": every attempt failed to reach the gateway, no money moved as far as we know.
+# "outcome unknown": the last attempt was started but its answer was never recorded; with a
+# real provider an operator must check the provider's status before replaying.
 GATEWAY_UNAVAILABLE = "gateway_unavailable_after_budget"
+GATEWAY_OUTCOME_UNKNOWN = "gateway_outcome_unknown_after_budget"
 DELIVERY_OUTCOME_UNKNOWN = "delivery_outcome_unknown_after_budget"
 
 
@@ -102,12 +106,20 @@ class ProcessPayment:
             if payment.is_processing_halted:
                 # The gateway budget is used up. Only an operator replay may continue.
                 return ProcessOutcome.NOOP
-            if self._retry.is_exhausted(payment.gateway_attempts):
-                # Budget spent but not halted: a worker died right after its last attempt.
-                # Do not call the gateway a fourth time; hand the payment to an operator.
-                return await self._halt_processing(uow, payment, payment.gateway_attempts, event_id)
-            if not payment.claim_processing(token, self._clock.now(), self._processing_lease):
+            now = self._clock.now()
+            if payment.processing_lease_active(now):
+                # Another worker is talking to the gateway right now (maybe on the last
+                # attempt). A duplicate message must not interfere with it in any way.
                 return ProcessOutcome.SKIPPED_LEASED
+            if self._retry.is_exhausted(payment.gateway_attempts):
+                # Budget spent, nobody holds the lease, no result: the worker that made the
+                # last attempt died before recording the answer. The outcome is unknown; do
+                # not call the gateway a fourth time, hand the payment to an operator.
+                return await self._halt_processing(
+                    uow, payment, payment.gateway_attempts, event_id, GATEWAY_OUTCOME_UNKNOWN
+                )
+            if not payment.claim_processing(token, now, self._processing_lease):
+                return ProcessOutcome.SKIPPED_LEASED  # pragma: no cover - checked above
             payment.record_gateway_attempt()
             attempt = payment.gateway_attempts
             await uow.payments.save(payment)
@@ -157,7 +169,9 @@ class ProcessPayment:
                 log.warning("stale processing lease", extra={"payment_id": str(payment_id)})
                 return ProcessOutcome.SKIPPED_STALE
             if self._retry.is_exhausted(attempt):
-                return await self._halt_processing(uow, payment, attempt, event_id, exc.code)
+                return await self._halt_processing(
+                    uow, payment, attempt, event_id, GATEWAY_UNAVAILABLE, failure_code=exc.code
+                )
             payment.release_processing(token)
             delay = self._retry.delay_before(attempt + 1)
             await uow.outbox.add(
@@ -183,17 +197,23 @@ class ProcessPayment:
         payment: Payment,
         attempts: int,
         event_id: uuid.UUID | None,
-        error_code: str = GATEWAY_UNAVAILABLE,
+        reason: str,
+        *,
+        failure_code: str | None = None,
     ) -> ProcessOutcome:
-        """Stop calling the gateway and write the dead-letter event in the same transaction."""
+        """Stop calling the gateway and write the dead-letter event in the same transaction.
+
+        ``reason`` is the category stored on the payment (unavailable vs outcome unknown);
+        ``failure_code`` is the last concrete error, for the dead-letter message.
+        """
         now = self._clock.now()
-        payment.halt_processing(reason=GATEWAY_UNAVAILABLE, now=now)
+        payment.halt_processing(reason=reason, now=now)
         await uow.outbox.add(
             payment_dead_letter_event(
                 payment,
                 phase=Phase.PROCESS,
                 attempts=attempts,
-                failure_code=error_code,
+                failure_code=failure_code or reason,
                 original_event_id=event_id,
                 now=now,
             )
@@ -202,7 +222,12 @@ class ProcessPayment:
         await uow.commit()
         log.error(
             "gateway budget exhausted, payment halted",
-            extra={"payment_id": str(payment.id), "attempt": attempts, "error_code": error_code},
+            extra={
+                "payment_id": str(payment.id),
+                "attempt": attempts,
+                "reason": reason,
+                "error_code": failure_code or reason,
+            },
         )
         return ProcessOutcome.DEAD_LETTERED
 

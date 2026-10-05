@@ -314,7 +314,37 @@ async def test_budget_spent_without_halt_is_halted_before_calling_the_gateway(
     process, gateway, _ = build(uow_factory, clock)
     assert await process(seeded.id) is ProcessOutcome.DEAD_LETTERED
     assert gateway.charges == []
-    assert store.payments[seeded.id].is_processing_halted
+    saved = store.payments[seeded.id]
+    assert saved.is_processing_halted
+    assert saved.processing_halt_reason == "gateway_outcome_unknown_after_budget"
+    [dead] = store.unpublished()
+    assert dead.payload["failure_code"] == "gateway_outcome_unknown_after_budget"
+
+
+async def test_duplicate_during_last_gateway_call_waits_instead_of_halting(
+    uow_factory, store, clock, seeded
+) -> None:
+    """Review blocker 1: a duplicate must never halt a payment whose last attempt is running."""
+    seeded.gateway_attempts = 2
+    store.payments[seeded.id] = seeded
+    outcomes: dict[str, ProcessOutcome] = {}
+
+    class SlowGateway:
+        async def charge(self, payment):  # type: ignore[no-untyped-def]
+            # The duplicate arrives while attempt 3 is in flight and the lease is active.
+            outcomes["duplicate"] = await process_b(payment.id)
+            return SUCCESS
+
+    process_a, _, _ = build(uow_factory, clock, gateway=SlowGateway())  # type: ignore[arg-type]
+    process_b, gateway_b, _ = build(uow_factory, clock)
+    assert await process_a(seeded.id) is ProcessOutcome.COMPLETED
+    assert outcomes["duplicate"] is ProcessOutcome.SKIPPED_LEASED
+    assert gateway_b.charges == []
+    saved = store.payments[seeded.id]
+    assert saved.status is PaymentStatus.SUCCEEDED
+    assert saved.gateway_attempts == 3
+    assert not saved.is_processing_halted
+    assert not store.unpublished()
 
 
 # ------------------------------------------------------------ leases / races

@@ -31,10 +31,19 @@ Both slow calls are owned by a **lease token**:
 * `notification_lease_token`: the same rule for webhook attempts. A late outcome from an
   old attempt is ignored; the record of the worker that currently owns the attempt wins.
 
+Before touching a pending payment a worker checks, under the row lock and in this order:
+is there an active lease (someone is talking to the gateway right now → skip), is the
+budget spent with nobody holding a lease (the last worker died mid-call → halt), and only
+then does it reserve the payment and count a new attempt. The order matters: a duplicate
+message must never halt a payment whose last attempt is still running.
+
 When the gateway budget is spent the payment is **halted** (`processing_halted_at`,
 `processing_halt_reason`). It stays `pending` — unknown is not declined — and waits for an
-operator. A webhook whose last attempt has an unknown outcome is marked `exhausted` with
-reason `delivery_outcome_unknown_after_budget`; replay re-sends the same event id.
+operator. Two reasons are distinguished: `gateway_unavailable_after_budget` (every attempt
+failed to reach the gateway) and `gateway_outcome_unknown_after_budget` (the last attempt
+was started but its answer was never recorded; with a real provider, check its status
+before replaying). A webhook whose last attempt has an unknown outcome is marked `exhausted`
+with reason `delivery_outcome_unknown_after_budget`; replay re-sends the same event id.
 
 The outbox relay and the recovery scan run inside the consumer process as supervised
 background loops. They publish through the outbox; they are not a second consumer. If one of

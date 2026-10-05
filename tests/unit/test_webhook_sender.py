@@ -138,6 +138,117 @@ async def test_strict_policy_connects_to_the_checked_address(
     assert req.extensions["sni_hostname"] == "merchant.example"
 
 
+def _scripted_dns(monkeypatch: pytest.MonkeyPatch, *answers: object) -> list[int]:
+    """Each call to getaddrinfo pops one answer: an exception to raise, a list, or "hang"."""
+    import asyncio
+    import socket
+
+    script = list(answers)
+    calls = [0]
+
+    async def fake_getaddrinfo(*_: object, **__: object) -> list[tuple]:  # type: ignore[type-arg]
+        calls[0] += 1
+        answer = script.pop(0)
+        if answer == "hang":
+            await asyncio.sleep(3600)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer  # type: ignore[return-value]
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", fake_getaddrinfo)
+    _ = socket  # keep the import explicit for readers
+    return calls
+
+
+PUBLIC = [(0, 0, 0, "", ("93.184.216.34", 0))]
+
+
+async def test_dns_failure_is_a_retryable_delivery_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    import socket
+
+    calls = _scripted_dns(monkeypatch, socket.gaierror("temporary failure"), PUBLIC)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(204)
+
+    s = sender(handler, WebhookUrlPolicy())
+    with pytest.raises(WebhookDeliveryError) as exc:
+        await s.deliver("https://merchant.example/hooks", uuid.uuid4(), BODY)
+    assert exc.value.code == "dns_resolution_failed"
+    assert exc.value.retryable
+    assert seen == []  # nothing was sent
+    await s.deliver("https://merchant.example/hooks", uuid.uuid4(), BODY)  # next attempt works
+    assert len(seen) == 1
+    assert calls[0] == 2  # the name was resolved and checked again
+
+
+async def test_dns_timeout_is_bounded_and_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _scripted_dns(monkeypatch, "hang")
+    s = sender(lambda _: httpx.Response(204), WebhookUrlPolicy(dns_timeout_seconds=0.05))
+    with pytest.raises(WebhookDeliveryError) as exc:
+        await s.deliver("https://merchant.example/hooks", uuid.uuid4(), BODY)
+    assert exc.value.code == "dns_timeout"
+    assert exc.value.retryable
+
+
+async def test_dns_answer_with_private_address_is_permanent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _scripted_dns(monkeypatch, [(0, 0, 0, "", ("10.0.0.5", 0))])
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(204)
+
+    with pytest.raises(WebhookDeliveryError) as exc:
+        await sender(handler, WebhookUrlPolicy()).deliver(
+            "https://merchant.example/hooks", uuid.uuid4(), BODY
+        )
+    assert exc.value.code == "url_rejected:resolves_to_private_address"
+    assert not exc.value.retryable
+    assert calls == 0
+
+
+async def test_three_dns_failures_use_the_normal_budget(
+    monkeypatch: pytest.MonkeyPatch, uow_factory, store, clock
+) -> None:
+    """DNS outage → retry, retry, DLQ — exactly like a 500 from the receiver."""
+    import socket
+    from datetime import timedelta
+
+    from payments.application.process_payment import ProcessOutcome, ProcessPayment
+    from payments.application.retry import RetryPolicy
+    from payments.domain.payment import NotificationStatus
+    from tests.fakes import SUCCESS, FakeGateway, make_payment
+
+    _scripted_dns(monkeypatch, *[socket.gaierror("down")] * 3)
+    payment = make_payment(webhook_url="https://merchant.example/hooks")
+    store.payments[payment.id] = payment
+    process = ProcessPayment(
+        uow_factory=uow_factory,
+        gateway=FakeGateway(SUCCESS),
+        webhooks=sender(lambda _: httpx.Response(204), WebhookUrlPolicy()),
+        clock=clock,
+        retry_policy=RetryPolicy(),
+        processing_lease=timedelta(seconds=60),
+    )
+    outcomes = []
+    for _ in range(3):
+        outcomes.append(await process(payment.id))
+        for e in store.unpublished():
+            e.published_at = clock.now()
+        clock.advance(timedelta(seconds=5))
+    assert outcomes == [ProcessOutcome.RETRY_SCHEDULED] * 2 + [ProcessOutcome.DEAD_LETTERED]
+    saved = store.payments[payment.id]
+    assert saved.notification_status is NotificationStatus.EXHAUSTED
+    assert saved.notification_attempts == 3
+    assert saved.notification_last_error == "dns_resolution_failed"
+
+
 async def test_dev_policy_keeps_hostnames(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[httpx.Request] = []
 

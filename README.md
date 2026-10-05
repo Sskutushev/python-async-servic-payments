@@ -4,8 +4,19 @@ FastAPI · Pydantic v2 · SQLAlchemy 2.0 (async) · PostgreSQL · RabbitMQ (Fast
 
 A client sends a payment. The API saves it and answers `202` right away. A background consumer
 then charges a (simulated) payment gateway, saves the result and sends a signed webhook to the
-client. Nothing is lost on the way and nothing is done twice: the same request, the same
-message or the same crash replayed again always ends in the same state.
+client.
+
+The exact promises, in one place:
+
+* one `Idempotency-Key` → one stored payment, however many times the request is repeated;
+* every event is delivered **at least once**; the consumer reads the saved state before each
+  step, so a duplicate message or a crash replayed later ends in the same state;
+* the simulated gateway is called at most three counted times per payment, and its answer
+  for a given payment id is always the same;
+* a webhook **may arrive more than once** with the same `event_id`; it is never sent more
+  than three counted times without an operator's replay.
+
+There is no "exactly once" anywhere in this list on purpose — see ADR-0001.
 
 ```
             ┌──────────┐  one transaction: payment + event  ┌──────────────┐
@@ -108,7 +119,11 @@ How answers are read: `2xx` delivered · `408`, `429`, `5xx`, timeout, connectio
 | Worker dies during the **3rd** webhook attempt | no 4th call: the payment goes to an operator as `delivery_outcome_unknown_after_budget` | `…::test_crash_during_third_webhook_attempt…`, `tests/integration/test_recovery_budget_pg.py` |
 | Two workers get the same message | one charges, the other skips; a worker whose reservation expired cannot write anything — not a result, not a retry | `…::test_stale_worker…`, `test_recovery_budget_pg.py` |
 | Two webhook attempts overlap | the late outcome of the old attempt is ignored; the newer record wins | `…::test_late_outcome_of_a_stale_webhook_attempt…`, `test_recovery_budget_pg.py` |
-| Gateway unreachable three times | the payment stays `pending` (unknown ≠ declined), is **halted** and goes to the DLQ; duplicates and the recovery scan never trigger a 4th call | `…::test_halted_payment_is_never_charged_again_until_replay`, `test_recovery_budget_pg.py` |
+| Gateway unreachable three times | the payment stays `pending` (unknown ≠ declined), is **halted** with reason `gateway_unavailable_after_budget` and goes to the DLQ; duplicates and the recovery scan never trigger a 4th call | `…::test_halted_payment_is_never_charged_again_until_replay`, `test_recovery_budget_pg.py` |
+| Duplicate message arrives **while the 3rd gateway call is in flight** | the duplicate sees the active reservation and skips; the running call finishes and its result is saved | `test_recovery_budget_pg.py::test_duplicate_during_third_gateway_call_does_not_halt`, `test_state_boundaries.py` |
+| Worker dies **during** the 3rd gateway call | once the reservation expires: no 4th call, halted with reason `gateway_outcome_unknown_after_budget` — the answer is unknown, not a confirmed decline | `test_recovery_budget_pg.py::test_lost_third_gateway_attempt_halts_without_fourth_call` |
+| DNS fails or hangs while sending a webhook | counts as a temporary delivery error: the normal three attempts apply; a hanging resolver is cut off after `dns_timeout_seconds` | `test_webhook_sender.py::test_dns_*` |
+| Two merchant hostnames share one IP | each webhook opens its own TLS connection; a connection verified for one hostname is never reused for another | `tests/unit/test_webhook_tls.py` (real TLS server) |
 | Operator runs `replay` | only then a new set of three attempts opens, for the failed step only, with the same webhook event id | `tests/unit/test_recovery_and_replay.py` |
 | Broken message or unknown payment id | rejected; RabbitMQ moves it to `payments.dlq` | `tests/rabbit/test_broker.py` |
 | `webhook_url` points at localhost, a private network, the cloud metadata IP, has credentials, uses `http` | `422` at creation; refused again at send time | `test_url_policy.py`, `test_api.py` |
@@ -120,9 +135,15 @@ never sent more than three counted times without an operator's replay. "Three at
 three in total, counted *before* each call, so a crash during a call still counts. "Unknown" is a
 separate state from "declined": an outage never turns a payment into `failed`.
 
-What a real gateway would need on top: send `payment.id` as the provider's idempotency key and
-add a status lookup for the "we charged but lost the answer" case. The `PaymentGateway`
-interface says so; the simulator does not need it because its answer depends only on the id.
+### Not for real money without a provider adapter
+
+The gateway here is a simulator, as the task asks. Its answer depends only on the payment id,
+so "call it again" is always safe. A real provider is different: after a network failure the
+money may have moved even though we never saw the answer. Before this service is pointed at a
+real provider, the adapter must send `payment.id` as the provider's idempotency key and must
+offer a status lookup, and an operator must consult that lookup before replaying a payment
+halted as `gateway_outcome_unknown_after_budget`. The `PaymentGateway` interface documents
+both requirements; nothing in this repository claims to have met them.
 
 ## Retries, dead letters, recovery (ADR-0002, ADR-0003)
 

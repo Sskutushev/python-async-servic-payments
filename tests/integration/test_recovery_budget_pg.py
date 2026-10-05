@@ -114,6 +114,76 @@ async def test_gateway_budget_survives_recovery_and_duplicates(
     assert (await load(uow_factory, payment.id)).status is PaymentStatus.SUCCEEDED
 
 
+# 1b (review blocker 1) ------------------------------------------------------------------
+async def test_duplicate_during_third_gateway_call_does_not_halt(
+    uow_factory, clock: FakeClock
+) -> None:
+    """A duplicate delivered while attempt 3 is in flight must skip, not halt the payment."""
+    payment = await seed(uow_factory)
+    async with uow_factory() as uow:
+        p = await uow.payments.get_for_update(payment.id)
+        assert p is not None
+        p.gateway_attempts = 2  # two earlier attempts failed to reach the gateway
+        await uow.payments.save(p)
+        await uow.commit()
+
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowGateway:
+        calls = 0
+
+        async def charge(self, p):  # type: ignore[no-untyped-def]
+            SlowGateway.calls += 1
+            in_flight.set()
+            await release.wait()
+            return SUCCESS
+
+    process_a, _, _ = build(uow_factory, clock, gateway=SlowGateway())
+    task_a = asyncio.create_task(process_a(payment.id))
+    await in_flight.wait()
+
+    process_b, gateway_b, _ = build(uow_factory, clock)  # the duplicate
+    assert await process_b(payment.id) is ProcessOutcome.SKIPPED_LEASED
+    assert gateway_b.charges == []
+    mid = await load(uow_factory, payment.id)
+    assert mid.processing_lease_token is not None  # A still owns the payment
+    assert not mid.is_processing_halted
+    assert await unpublished(uow_factory, clock) == []  # no DLQ event
+
+    release.set()
+    assert await task_a is ProcessOutcome.COMPLETED
+    saved = await load(uow_factory, payment.id)
+    assert saved.status is PaymentStatus.SUCCEEDED
+    assert saved.gateway_attempts == 3
+    assert SlowGateway.calls == 1
+
+
+async def test_lost_third_gateway_attempt_halts_without_fourth_call(
+    uow_factory, clock: FakeClock
+) -> None:
+    """The worker died during attempt 3: after its lease expires, halt as "outcome unknown"."""
+    payment = await seed(uow_factory)
+    async with uow_factory() as uow:
+        p = await uow.payments.get_for_update(payment.id)
+        assert p is not None
+        p.gateway_attempts = 3
+        p.claim_processing(uuid.uuid4(), clock.now(), LEASE)  # the dead worker's reservation
+        await uow.payments.save(p)
+        await uow.commit()
+
+    process, gateway, _ = build(uow_factory, clock)
+    assert await process(payment.id) is ProcessOutcome.SKIPPED_LEASED
+    clock.advance(LEASE + timedelta(seconds=1))
+    assert await process(payment.id) is ProcessOutcome.DEAD_LETTERED
+    assert gateway.charges == []
+    saved = await load(uow_factory, payment.id)
+    assert saved.status is PaymentStatus.PENDING
+    assert saved.processing_halt_reason == "gateway_outcome_unknown_after_budget"
+    [dead] = await unpublished(uow_factory, clock)
+    assert dead.payload["failure_code"] == "gateway_outcome_unknown_after_budget"
+
+
 # 2 ---------------------------------------------------------------------------------------
 async def test_stale_worker_transport_error_writes_nothing(uow_factory, clock: FakeClock) -> None:
     payment = await seed(uow_factory)

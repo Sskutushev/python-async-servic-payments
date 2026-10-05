@@ -28,6 +28,16 @@ IpAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 
 class WebhookUrlRejected(ValueError):
+    """The URL breaks a rule. Permanent: no amount of retrying will make it acceptable."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class WebhookHostUnresolvable(Exception):
+    """We could not find out the address right now (DNS error or timeout). Worth retrying."""
+
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
@@ -54,6 +64,7 @@ class WebhookUrlPolicy:
     allowed_hosts: Sequence[str] = field(default_factory=tuple)
     allow_private_networks: bool = False  # dev only
     allow_insecure_http: bool = False  # dev only
+    dns_timeout_seconds: float = 3.0  # a hanging resolver must not block the consumer
 
     def validate(self, url: str) -> str:
         """Return the URL if it is acceptable, otherwise raise ``WebhookUrlRejected``."""
@@ -72,6 +83,9 @@ class WebhookUrlPolicy:
         Returns the address the sender must connect to (the first public answer), so the
         connection goes to exactly what was checked. Returns ``None`` in dev mode, where
         hostnames are used as they are.
+
+        Raises ``WebhookUrlRejected`` for a forbidden address (permanent) and
+        ``WebhookHostUnresolvable`` when DNS fails or times out (temporary).
         """
         if self.allow_private_networks:
             return None
@@ -123,13 +137,17 @@ class WebhookUrlPolicy:
         host = host.lower().rstrip(".")
         return any(host == h or host.endswith("." + h) for h in self.allowed_hosts)
 
-    @staticmethod
-    async def _resolve(host: str) -> list[IpAddress]:
+    async def _resolve(self, host: str) -> list[IpAddress]:
         loop = asyncio.get_running_loop()
         try:
-            infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-        except socket.gaierror as exc:
-            raise WebhookUrlRejected("dns_resolution_failed") from exc
+            infos = await asyncio.wait_for(
+                loop.getaddrinfo(host, None, type=socket.SOCK_STREAM),
+                timeout=self.dns_timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise WebhookHostUnresolvable("dns_timeout") from exc
+        except (socket.gaierror, OSError) as exc:
+            raise WebhookHostUnresolvable("dns_resolution_failed") from exc
         if not infos:
-            raise WebhookUrlRejected("dns_resolution_failed")
+            raise WebhookHostUnresolvable("dns_resolution_failed")
         return [ipaddress.ip_address(info[4][0]) for info in infos]

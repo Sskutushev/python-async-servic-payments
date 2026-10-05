@@ -18,24 +18,39 @@ from __future__ import annotations
 import ipaddress
 import uuid
 from datetime import timedelta
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from payments.application.ports import Clock, WebhookDeliveryError
 from payments.infrastructure.signing import canonical_body, sign
-from payments.infrastructure.url_policy import IpAddress, WebhookUrlPolicy, WebhookUrlRejected
+from payments.infrastructure.url_policy import (
+    IpAddress,
+    WebhookHostUnresolvable,
+    WebhookUrlPolicy,
+    WebhookUrlRejected,
+)
 
 RETRYABLE_STATUSES = frozenset({408, 429})
 MAX_RETRY_AFTER = timedelta(hours=1)
 
 
-def build_http_client(timeout_seconds: float) -> httpx.AsyncClient:
+def build_http_client(timeout_seconds: float, *, verify: Any = True) -> httpx.AsyncClient:
+    """The client used for every webhook.
+
+    Keep-alive is off on purpose. Requests are pinned to an IP address, so two different
+    merchant hostnames that share an IP would look like the same origin to the connection
+    pool, and the pool could reuse a TLS connection whose certificate was checked for the
+    *other* hostname. One fresh connection per webhook (a TLS handshake each time) is a
+    cheap price for never getting that wrong. ``verify`` exists for tests with a local CA.
+    """
     return httpx.AsyncClient(
         timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 3.0)),
-        limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
+        limits=httpx.Limits(max_connections=50, max_keepalive_connections=0),
         follow_redirects=False,
         trust_env=False,  # ignore proxy settings from the environment
+        verify=verify,
         headers={"User-Agent": "payments-webhook/1.0"},
     )
 
@@ -89,7 +104,11 @@ class HttpWebhookSender:
             self._policy.validate(url)
             address = await self._policy.check_resolved(url)
         except WebhookUrlRejected as exc:
+            # A forbidden URL stays forbidden: no retry.
             raise WebhookDeliveryError(f"url_rejected:{exc.reason}", retryable=False) from exc
+        except WebhookHostUnresolvable as exc:
+            # DNS hiccup or timeout: nothing was sent, the normal retry budget applies.
+            raise WebhookDeliveryError(exc.reason, retryable=True) from exc
 
         timestamp = str(int(self._clock.now().timestamp()))
         headers = {
