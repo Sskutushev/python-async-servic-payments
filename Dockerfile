@@ -15,13 +15,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
 FROM python:3.12-slim-bookworm AS runtime
-RUN groupadd --system app && useradd --system --gid app --home /app app \
-    && apt-get update && apt-get install -y --no-install-recommends curl \
+# Numeric uid/gid so the user resolves on any host and in Kubernetes runAsNonRoot checks.
+RUN groupadd --system --gid 10001 app \
+    && useradd --system --uid 10001 --gid 10001 --home /app --shell /usr/sbin/nologin app \
+    && apt-get update \
+    # pick up Debian security fixes published after the base image was built
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY --from=builder --chown=app:app /app /app
+COPY --from=builder --chown=10001:10001 /app /app
 ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
-USER app
+USER 10001:10001
 EXPOSE 8000
 ENTRYPOINT ["payments"]
 CMD ["api"]
